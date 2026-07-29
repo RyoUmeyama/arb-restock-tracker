@@ -566,7 +566,7 @@ DETECTED_LOTTERIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)
 
 def save_lottery_candidates(cands):
     """検知した抽選候補を data/detected_lotteries.json に追記保存する（id重複は除外・上限200）。
-    このファイルはActionsがリポジトリにコミットし、応募台帳（pokemon-card-30th-tracker）が
+    このファイルはActionsがリポジトリにコミットし、応募台帳（arb-lottery-ledger）が
     取り込んで締切リマインドを行う（案A/案B: 台帳の一本化・2026-07-14）。"""
     if not cands:
         return
@@ -931,7 +931,7 @@ def append_heartbeat(prev, new_state, alerts, health):
     lines.append("このレポートが毎朝届いていればBotは正常稼働しています。")
     hb_item = {
         "name": "📊 日次ヘルスレポート（Bot生存確認）",
-        "url": "https://github.com/RyoUmeyama/gunpla-restock-tracker/actions",
+        "url": "https://github.com/RyoUmeyama/arb-restock-tracker/actions",
         "retail_price": 0,
     }
     print("  📊 日次ヘルスレポートを送信")
@@ -1329,7 +1329,7 @@ def main():
         print("=== TEST_NOTIFY: 通知経路テスト ===")
         test_item = {
             "name": "【通知経路テスト】これはテスト送信です",
-            "url": "https://github.com/RyoUmeyama/gunpla-restock-tracker",
+            "url": "https://github.com/RyoUmeyama/arb-restock-tracker",
             "retail_price": 0,
         }
         notify([(test_item, "Secrets再登録後の疎通確認。届けばメール/Discordとも正常。", "stock")])
