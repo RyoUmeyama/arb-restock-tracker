@@ -32,7 +32,8 @@ from netutil import _UNREACHABLE_HOSTS, http_get, fetch
 from rules import (
     _this_year, _upcoming_dates, _normalize_box_name, _deck_supply_rule,
     _is_actionable_line, _expired_pokeca_titles, _mentions_expired,
-    match_altema_price, passes_profit, _item_short_name, extract_lottery_candidate,
+    match_altema_price, passes_profit, net_proceeds, _item_short_name,
+    extract_lottery_candidate,
 )
 from links import (
     _norm_link_text, _clean_store_url, _unwrap_affiliate, extract_anchors,
@@ -780,7 +781,7 @@ def run_price_screen(prev, new_state):
             drop_counts[key] = drop_counts.get(key, 0) + 1
         else:
             drop_counts[key] = 0
-        net = market * (1 - config.FEE_RATE) - retail
+        net = net_proceeds(retail, market)
         flag = ""
         if verdict == "dropped" and drop_counts[key] >= config.DROP_CONFIRM_COUNT:
             flag = f"  ⚠除外候補(連続{drop_counts[key]}回・自動除外は未有効)"

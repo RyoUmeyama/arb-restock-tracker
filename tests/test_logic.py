@@ -54,12 +54,47 @@ class TestPassesProfit(unittest.TestCase):
         self.assertEqual(cs.passes_profit(5000, 5500, False), "unknown")
 
     def test_pokeca_active_at_retail_plus(self):
-        # ポケカは閾値1.0: 定価超で手数料後も黒字なら active
+        # ポケカは閾値1.0: 買取相場が定価超なら active
         self.assertEqual(cs.passes_profit(5000, 6000, True), "active")
 
     def test_invalid_inputs_unknown(self):
         self.assertEqual(cs.passes_profit(0, 10000, False), "unknown")
         self.assertEqual(cs.passes_profit(5000, None, False), "unknown")
+
+    def test_pokeca_thin_spread_not_dropped(self):
+        """買取相場が定価をわずかに超える薄利ケース。
+
+        回帰テスト（2026-07-29）: 以前は買取価格からさらに10%を二重控除しており、
+        定価6,000/買取6,300（実際は+300円の黒字）を net=-330 と誤判定して
+        機会を取りこぼしていた。二重控除を解消した今は黒字として扱われる。
+        """
+        self.assertEqual(cs.net_proceeds(6000, 6300), 300)
+        self.assertEqual(cs.passes_profit(6000, 6300, True), "active")
+
+
+class TestNetProceeds(unittest.TestCase):
+    """手残り計算: 買取価格からの二重控除をしない。"""
+
+    def test_no_double_deduction(self):
+        # altemaの相場は買取価格(手取り)。そのまま定価を引いた額が手残り。
+        self.assertEqual(cs.net_proceeds(6000, 7500), 1500)
+
+    def test_loss_when_below_retail(self):
+        self.assertEqual(cs.net_proceeds(6000, 5800), -200)
+
+    def test_invalid_inputs_none(self):
+        self.assertIsNone(cs.net_proceeds(0, 10000))
+        self.assertIsNone(cs.net_proceeds(5000, None))
+
+    def test_sell_cost_rate_applied_when_configured(self):
+        """フリマ前提で評価したい場合は SELL_COST_RATE で控除できる。"""
+        import config
+        orig = config.SELL_COST_RATE
+        try:
+            config.SELL_COST_RATE = 0.10
+            self.assertAlmostEqual(cs.net_proceeds(6000, 10000), 3000)
+        finally:
+            config.SELL_COST_RATE = orig
 
 
 class TestAltemaMatch(unittest.TestCase):

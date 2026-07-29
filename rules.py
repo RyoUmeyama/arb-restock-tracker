@@ -47,14 +47,32 @@ def match_altema_price(name, prices):
     return candidates[0][1]
 
 
+def net_proceeds(retail, market):
+    """定価と相場から手残り（円）を返す。
+
+    market の取得元は altema の【買取価格】= 店に持ち込んで受け取る額であり、
+    店側の利ざやが既に差し引かれた「手取り」である（fetch_altema_box_prices 参照）。
+    さらに docs/15 の出口優先順位は 1位=店頭買取(手数料・送料ゼロ)、
+    メルカリ(10%)は7位で「反復即売りに非推奨」。
+    したがって買取価格からさらに販売手数料を引くのは二重控除になる。
+
+    販売コスト（送料・梱包）は出口が店頭持込なら実質ゼロ。宅配買取を使う場合も
+    もえたく!/トレトクは全手数料無料のため、既定では控除しない。
+    フリマ経由を前提に評価したい場合のみ config.SELL_COST_RATE を上げる。
+    """
+    if not retail or not market or retail <= 0 or market <= 0:
+        return None
+    return market * (1 - config.SELL_COST_RATE) - retail
+
+
 def passes_profit(retail, market, is_pokeca):
     """相場選別: 市場価格と定価から、監視ON/除外を判定する。
     返り値: 'active'(監視ON) / 'dropped'(除外) / 'unknown'(判定不能=安全側で監視継続)。
-    ポケカは別格で閾値を下げる(定価以上で売れれば監視)。"""
-    if not retail or not market or retail <= 0 or market <= 0:
+    ポケカは別格で閾値を下げる(定価以上の鞘が出れば監視)。"""
+    net = net_proceeds(retail, market)
+    if net is None:
         return "unknown"
     spread = market / retail
-    net = market * (1 - config.FEE_RATE) - retail
     spread_in = config.POKECA_SPREAD_IN if is_pokeca else config.PROFIT_SPREAD_IN
     if spread >= spread_in and net > 0:
         return "active"
