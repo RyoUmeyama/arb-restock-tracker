@@ -111,6 +111,36 @@ class TestAltemaMatch(unittest.TestCase):
     def test_short_core_not_matched(self):
         self.assertIsNone(cs.match_altema_price("BOX", {"何か": 1000}))
 
+    def test_decorated_watch_name_matches_plain_altema_name(self):
+        """監視名に装飾が付き、altema側が素の単品名のケース（逆方向の部分一致）。
+
+        回帰テスト（2026-07-29）: 以前は『監視名 in altema名』の方向しか見ておらず、
+        anime-matsuriまとめページ由来の監視名（大半がこの形）が1件も相場評価されず、
+        ポケカ15銘柄すべてが相場選別から抜け落ちていた。
+        """
+        prices = {"アビスアイ": 14000}
+        self.assertEqual(
+            cs.match_altema_price("ポケカ アビスアイ 抽選/再販まとめ（anime-matsuri）", prices),
+            14000,
+        )
+
+    def test_backward_match_prefers_longest_not_shortest(self):
+        """逆方向の部分一致では【最長】が正しい（上位概念への誤マッチ防止）。
+
+        「ロケット団の栄光」に対し、より短い別商品「ロケット団」(ヴィンテージ・13万円)が
+        存在する。最短を採ると別物の相場を掴んで手残りを大幅に誤る。
+        """
+        prices = {"ロケット団": 130000, "ロケット団の栄光": 25500, "ロケット団の逆襲": 320000}
+        self.assertEqual(
+            cs.match_altema_price("ポケカ ロケット団の栄光 抽選/再販まとめ（anime-matsuri）", prices),
+            25500,
+        )
+
+    def test_forward_match_still_prefers_shortest(self):
+        """順方向（監視名が短くaltema側が装飾付き）では従来どおり最短を採る。"""
+        prices = {"ホワイトフレア＋おまけ付き限定セット": 30000, "ホワイトフレアBOX": 17000}
+        self.assertEqual(cs.match_altema_price("ポケカ ホワイトフレア", prices), 17000)
+
 
 class TestRakutenParse(unittest.TestCase):
     """楽天ブックス在庫判定: 定価近傍のみ在庫あり。"""

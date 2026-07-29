@@ -34,17 +34,34 @@ def match_altema_price(name, prices):
     core = _normalize_box_name(name)
     if len(core) < 3:  # 短すぎるコアは誤マッチしやすいので照合しない
         return None
-    candidates = []  # (正規化altema名長, price)
+    forward = []   # (正規化altema名長, price) : core in nk
+    backward = []  # (正規化altema名長, price) : nk in core
     for k, v in prices.items():
         nk = _normalize_box_name(k)
+        if len(nk) < 3:
+            continue
         if core == nk:
             return v  # 完全一致が最優先
+        # 双方向の部分一致を見る。方向ごとに「正しい候補」の選び方が逆になる点に注意。
         if core in nk:
-            candidates.append((len(nk), v))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])  # 最短=最も単品に近い
-    return candidates[0][1]
+            # (a) 監視名が短く、altema側が装飾付き。
+            #     長い名前はセット/同梱品など別物の罠なので【最短】を採る。
+            forward.append((len(nk), v))
+        elif nk in core:
+            # (b) altema側が単品BOX名で、監視名に「抽選/再販まとめ（anime-matsuri）」等の
+            #     装飾が付くケース。監視銘柄の大半（anime-matsuriまとめページ）はこちら。
+            #     2026-07-29まで (a) しか見ておらずポケカ15銘柄が1件も相場評価されていなかった。
+            #     この方向では【最長】が正しい。短い名前は上位概念への誤マッチになるため。
+            #     例)「ロケット団の栄光」に対し "ロケット団"(別商品・13万円) が
+            #        "ロケット団の栄光"(2.55万円) より短いという理由で勝ってしまう。
+            backward.append((len(nk), v))
+    if forward:
+        forward.sort(key=lambda x: x[0])       # 最短
+        return forward[0][1]
+    if backward:
+        backward.sort(key=lambda x: -x[0])     # 最長
+        return backward[0][1]
+    return None
 
 
 def net_proceeds(retail, market):
