@@ -318,6 +318,22 @@ WATCH_ITEMS = [
         "retail_price": 0,
         "key": "pokecard_info",
     },
+    # --- ポケセンオンライン 抽選（30th最重要。FUTURISTIC BOXはここが唯一の入手経路）---
+    # 公式(2026-07-13)が「本人認証機能を用いた抽選販売を8月から開始する予定」と明言。
+    # 応募開始日は未発表で、告知はこの2ページに出る。ポケカ公式info(pokecard_info)とは
+    # 別ドメイン・別導線のため個別に監視しないと取りこぼす。
+    # FUTURISTIC BOX(27,500円)はポケセンオンライン限定＝代替販路が存在しない。
+    {
+        "name": "ポケセンオンライン 抽選応募一覧（30th・応募開始の検知）",
+        "method": "page_update",
+        "url": "https://www.pokemoncenter-online.com/lottery/apply.html",
+        "retail_price": 0,
+        "key": "pokecen_lottery_apply",
+    },
+    # ※ポケセンオンライン ニュース一覧(/news/)は監視に入れない。
+    #   実査(2026-07-29)の結果、JSレンダリングで静的HTMLから本文を1行も拾えず
+    #   「抽出0行・判定不能」になる（トウキョーDX店頭ニュースと同じゾンビ化）。
+    #   抽選日程の告知は上の /lottery/apply.html と pokecard_info 側で捕捉する。
     # 追加の監視品はここに足す（方針順守: 非酒類・正規新品・未開封のまま売れる）
 ]
 
