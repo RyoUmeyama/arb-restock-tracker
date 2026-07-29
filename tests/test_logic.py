@@ -720,3 +720,57 @@ class TestLotteryCandidateExtraction(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReleaseCalendar(unittest.TestCase):
+    """発売カレンダー: これから発売する商品の抽出（A方針・docs/17）。"""
+
+    def _p(self, title, rdate, price):
+        return {"title": title, "releaseDate": rdate, "price": price, "link": ""}
+
+    def setUp(self):
+        from datetime import date
+        self.today = date(2026, 7, 29)
+        self.products = {
+            "a": self._p("「30th CELEBRATION FUTURISTIC BOX」", "2026年 9月16日（水）", "27,500円（税込）"),
+            "b": self._p("拡張パック「ストームエメラルダ」", "2026年 7月31日（金）", "200円（税込）"),
+            "c": self._p("ラバープレイマット メガレックウザ", "2026年 7月31日（金）", "2,970円（税込）"),
+            "d": self._p("デッキシールド イーブイ おやすみ", "2026年 7月31日（金）", "889円（税込）"),
+            "e": self._p("拡張パック「過去の弾」", "2025年 1月10日（金）", "200円（税込）"),
+        }
+
+    def _run(self, watched=()):
+        return cs.upcoming_releases(self.products, self.today, list(watched), 3000, 120)
+
+    def test_includes_future_box(self):
+        titles = [t for _, t, _, _ in self._run()]
+        self.assertIn("「30th CELEBRATION FUTURISTIC BOX」", titles)
+
+    def test_expansion_pack_not_filtered_by_pack_price(self):
+        """拡張パックは1パック価格(200円)で載るが、転売単位はBOX。価格で切ってはいけない。"""
+        titles = [t for _, t, _, _ in self._run()]
+        self.assertIn("拡張パック「ストームエメラルダ」", titles)
+
+    def test_excludes_supply_goods(self):
+        titles = [t for _, t, _, _ in self._run()]
+        self.assertNotIn("ラバープレイマット メガレックウザ", titles)
+        self.assertNotIn("デッキシールド イーブイ おやすみ", titles)
+
+    def test_excludes_past_releases(self):
+        titles = [t for _, t, _, _ in self._run()]
+        self.assertNotIn("拡張パック「過去の弾」", titles)
+
+    def test_excludes_already_watched(self):
+        watched = [cs._normalize_box_name("ストームエメラルダ")]
+        titles = [t for _, t, _, _ in self._run(watched)]
+        self.assertNotIn("拡張パック「ストームエメラルダ」", titles)
+
+    def test_sorted_by_release_date(self):
+        dates = [d for d, _, _, _ in self._run()]
+        self.assertEqual(dates, sorted(dates))
+
+    def test_window_days_limits_range(self):
+        out = cs.upcoming_releases(self.products, self.today, [], 3000, 7)
+        titles = [t for _, t, _, _ in out]
+        self.assertIn("拡張パック「ストームエメラルダ」", titles)   # 2日後
+        self.assertNotIn("「30th CELEBRATION FUTURISTIC BOX」", titles)  # 49日後

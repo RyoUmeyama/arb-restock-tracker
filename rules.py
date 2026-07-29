@@ -3,7 +3,7 @@
 規則の仕様は NOTIFICATION_RULES.md を参照。"""
 
 import re
-from datetime import datetime
+from datetime import date as _date, datetime
 
 import config
 
@@ -62,6 +62,75 @@ def match_altema_price(name, prices):
         backward.sort(key=lambda x: -x[0])     # 最長
         return backward[0][1]
     return None
+
+
+def parse_jp_release_date(text):
+    """「2026年 9月16日（水）」形式の発売日を date に変換する。解釈できなければ None。"""
+    if not text:
+        return None
+    m = re.search(r"(20\d\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
+    if not m:
+        return None
+    try:
+        return _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def parse_price_yen(text):
+    """「27,500円（税込）」形式の価格を int に変換する。解釈できなければ None。"""
+    if not text:
+        return None
+    m = re.search(r"([\d,]+)\s*円", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def upcoming_releases(products, today, watched_names, min_price, window_days):
+    """公式APIの商品リストから「これから発売＝定価入手の機会が来る」ものを返す。
+
+    A方針（既存カテゴリの続弾を早く掴む）の中核。
+    docs/17 の実データで、ポケカは新弾ごとに定価超の鞘が繰り返し発生することが
+    確認できている。発売前に把握できれば抽選応募・予約の機会を逃さない。
+
+    絞り込み:
+      - 発売日が今日以降〜window_days 以内（未来の確定日程のみ）
+      - 価格が min_price 以上（デッキシールド等の小物を除外）。
+        ただし拡張パックは【1パックの価格】(200〜360円)で載るため価格では切れない。
+        転売単位はBOX(1箱=30パック前後)なので、拡張パックは価格に関わらず必ず拾う。
+      - プレイマット/ファイル等の周辺グッズは転売対象外として除外
+      - 既存の監視銘柄と重複しないもの
+
+    返り値: [(発売日, タイトル, 価格, リンク)] を発売日の昇順で。
+    """
+    out = []
+    for p in (products or {}).values():
+        rd = parse_jp_release_date(p.get("releaseDate"))
+        if not rd or rd < today:
+            continue
+        if (rd - today).days > window_days:
+            continue
+        title = p.get("title") or ""
+        if any(kw in title for kw in config.RELEASE_EXCLUDE_KEYWORDS):
+            continue
+        price = parse_price_yen(p.get("price"))
+        # 拡張パックはBOX単位で転売するため、1パック価格による足切りをしない
+        is_pack = any(kw in title for kw in config.RELEASE_ALWAYS_KEYWORDS)
+        if not is_pack:
+            if price is None or price < min_price:
+                continue
+        nk = _normalize_box_name(title)
+        if not nk:
+            continue
+        if any(w and (w in nk or nk in w) for w in watched_names):
+            continue
+        out.append((rd, title, price or 0, p.get("link") or ""))
+    out.sort(key=lambda x: (x[0], -x[2]))
+    return out
 
 
 def net_proceeds(retail, market):

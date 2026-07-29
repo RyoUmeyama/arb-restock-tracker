@@ -33,7 +33,7 @@ from rules import (
     _this_year, _upcoming_dates, _normalize_box_name, _deck_supply_rule,
     _is_actionable_line, _expired_pokeca_titles, _mentions_expired,
     match_altema_price, passes_profit, net_proceeds, _item_short_name,
-    extract_lottery_candidate,
+    extract_lottery_candidate, upcoming_releases,
 )
 from links import (
     _norm_link_text, _clean_store_url, _unwrap_affiliate, extract_anchors,
@@ -612,8 +612,11 @@ def load_state():
 
 
 def save_state(state):
+    # "_" 始まりのキーは実行中のみ有効な一時値（例: _pokecard_raw）。
+    # stateファイル/Actionsキャッシュを肥大させないよう保存前に落とす。
+    persisted = {k: v for k, v in state.items() if not k.startswith("_")}
     with open(config.STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+        json.dump(persisted, f, ensure_ascii=False, indent=2)
 
 
 def run_discovery(prev, new_state, alerts):
@@ -1030,6 +1033,66 @@ def append_heartbeat(prev, new_state, alerts, health):
         print(f"  ⚠ 監視追加候補の算出でエラー（スキップ）: {e}")
 
 
+def report_release_calendar(prev, new_state, alerts, now_jst):
+    """A方針: これから発売する商品（＝定価入手の機会が来る物）を発売前に提示する。
+
+    ポケカ公式APIは未来の発売日が確定した商品を持つ。docs/17 の実データどおり
+    新弾は繰り返し定価超の鞘を生むため、発売前に把握できれば抽選・予約を逃さない。
+    既知の商品は再通知しない（state に発売日つきキーで保持）。
+    日次ヘルスレポートと同じ経路（alerts）に載せる。
+    """
+    if not config.RELEASE_CALENDAR_ENABLED:
+        return
+    try:
+        officials = new_state.get("pokecard_official") or prev.get("pokecard_official") or []
+        if not officials:
+            return
+        # state のキー "title|releaseDate" から products 相当を復元する
+        products = {}
+        for k in officials:
+            title, _, rdate = k.partition("|")
+            products[k] = {"title": title, "releaseDate": rdate, "price": "", "link": ""}
+        # 価格・リンクは state に無いため、APIの生データが今回取れていればそちらを優先
+        raw = new_state.get("_pokecard_raw") or {}
+        for k, v in raw.items():
+            products[k] = v
+
+        watched = [_normalize_box_name(it["name"]) for it in config.WATCH_ITEMS]
+        upcoming = upcoming_releases(
+            products, now_jst.date(), watched,
+            config.RELEASE_MIN_PRICE, config.RELEASE_WINDOW_DAYS,
+        )
+        seen_prev = prev.get("release_seen")
+        first = not isinstance(seen_prev, list)
+        seen = list(seen_prev or [])
+        fresh = [u for u in upcoming if f"{u[1]}|{u[0].isoformat()}" not in set(seen)]
+        for u in fresh:
+            seen.append(f"{u[1]}|{u[0].isoformat()}")
+        new_state["release_seen"] = seen[-config.DIGEST_SEEN_KEEP:]
+
+        if first:
+            print(f"  📅 発売カレンダー: 初回・{len(fresh)}件を記録（通知なし）")
+            return
+        if not fresh:
+            print("  📅 発売カレンダー: 新規なし")
+            return
+        lines = []
+        for rd, title, price, link in fresh[: config.RELEASE_MAX_LINES]:
+            days = (rd - now_jst.date()).days
+            lines.append(f"・{rd.isoformat()}（あと{days}日） {title} {price:,}円")
+        cal_item = {
+            "name": f"📅 これから発売 {len(fresh)}件（抽選・予約の機会）",
+            "url": "https://www.pokemon-card.com/products/",
+            "retail_price": 0,
+        }
+        print(f"  📅 発売カレンダー: 新規{len(fresh)}件を通知")
+        alerts.append((cal_item,
+                       "\n" + "\n".join(lines) +
+                       "\n（抽選・予約の受付が始まる前に応募経路を確認しておくこと）", "info"))
+    except Exception as e:
+        print(f"  ⚠ 発売カレンダーの算出でエラー（スキップ）: {e}")
+
+
 def _process_item(item, prev, new_state, alerts, health, candidates=None):
     """1監視項目の判定・状態更新・通知起票。run_once から項目ごとに例外隔離されて呼ばれる。"""
     key = item["key"]
@@ -1045,6 +1108,9 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
         health["ok"].append(item["name"])
         cur_keys = sorted(products.keys())
         new_state[key] = cur_keys
+        # 発売カレンダー用に価格・リンクを含む生データを同一実行内で渡す。
+        # state には保存しない（"_" 始まりは実行中のみ有効な一時値）。
+        new_state["_pokecard_raw"] = products
         prev_keys = prev.get(key, None)
         if prev_keys is None:
             print(f"  {item['name']}: 初回・{len(cur_keys)}商品を記録（通知なし）")
@@ -1306,6 +1372,10 @@ def run_once():
     stats["notified"] += len(alerts)
     stats["suppressed"] += health.get("suppressed", 0)
     new_state["weekly_stats"] = stats
+
+    # 発売カレンダー: これから発売する商品を発売前に提示（A方針・docs/17）
+    report_release_calendar(prev, new_state, alerts,
+                            datetime.now(ZoneInfo("Asia/Tokyo")))
 
     # 日次ヘルスレポート（JST9時以降の最初のパスで1通・生存確認）
     append_heartbeat(prev, new_state, alerts, health)
