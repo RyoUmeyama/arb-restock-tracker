@@ -14,6 +14,18 @@
   新サイトを足す場合は check_stock.py に判定関数を追加し、method を増やす。
 """
 
+# カードラボ等の実店舗ページ用の必須キーワード。
+# 店舗ページは1ページに全TCG（遊戯王/ヴァイスシュヴァルツ/ワンピ…）の告知・イベント・
+# 定型文が混在するため、行動語（予約/抽選/販売…）だけで絞ると
+# 「ヴァイスシュヴァルツ交流会」「商品ご予約について」のような無関係な行まで通ってしまう。
+# → 対象商材の名前を含む行だけを通知対象にする（require_keywords）。
+# 方針の主軸はポケカ（別格）。ワンピ/DBFWも監視銘柄があるため含める。
+CLABO_REQUIRE_KEYWORDS = [
+    "ポケモンカード", "ポケカ", "30th", "CELEBRATION",
+    "ワンピースカード", "ワンピカード",
+    "フュージョンワールド", "DBFW",
+]
+
 # 監視対象。各品に method（判定方式）・url・表示名・定価を持たせる。
 WATCH_ITEMS = [
     # ※ガンプラ監視（HGナイチンゲール/ガンプラ横断集約）は2026-07-10にユーザー指示で
@@ -329,6 +341,52 @@ WATCH_ITEMS = [
         "url": "https://www.pokemoncenter-online.com/lottery/apply.html",
         "retail_price": 0,
         "key": "pokecen_lottery_apply",
+    },
+    # --- カードラボ 東京都内店舗（店頭抽選の告知検知）---
+    # カードラボは抽選告知を「店舗ごとの店舗ブログ」で出す運用（全40店舗）。
+    # 実査(2026-07-29)では30thの告知は全店で未掲載で、直近は7/31発売スターターセットexの
+    # 抽選告知が大阪の店舗（なんば/オタロード/大阪日本橋）中心に出ていた。
+    # → 都内店舗の告知が出た瞬間を捉える必要がある。
+    # 応募方式は店舗ごとにバラバラ（実績: ①店舗Xをフォロー＆リポスト ②店頭カウンターで
+    # 申込用紙＋身分証提示）。方式は告知本文を読んで判断する。
+    # 都内は秋葉原3店＋池袋1店。ラジオ会館9Fに本店とサテライトが同居し、ゲーマーズB1も
+    # 徒歩数分なので1回の外出で回れる（docs/13の動線）。
+    # ※買取センター(kaitoricenter)は買取専門で販売抽選の対象外のため監視しない。
+    {
+        "name": "カードラボ 秋葉原ラジオ会館本店（店頭抽選の告知）",
+        "method": "page_update",
+        "url": "https://www.c-labo.jp/shop/radiohonten/",
+        "retail_price": 0,
+        "key": "clabo_akiba_radiohonten",
+        "strict_actions": True,
+        "require_keywords": CLABO_REQUIRE_KEYWORDS,
+    },
+    {
+        "name": "カードラボ サテライトショップTOKYO 秋葉原店（店頭抽選の告知）",
+        "method": "page_update",
+        "url": "https://www.c-labo.jp/shop/stakihabara/",
+        "retail_price": 0,
+        "key": "clabo_akiba_satellite",
+        "strict_actions": True,
+        "require_keywords": CLABO_REQUIRE_KEYWORDS,
+    },
+    {
+        "name": "カードラボ AKIHABARAゲーマーズB1店（店頭抽選の告知）",
+        "method": "page_update",
+        "url": "https://www.c-labo.jp/shop/akibagema/",
+        "retail_price": 0,
+        "key": "clabo_akiba_gamers",
+        "strict_actions": True,
+        "require_keywords": CLABO_REQUIRE_KEYWORDS,
+    },
+    {
+        "name": "カードラボ 池袋店（店頭抽選の告知）",
+        "method": "page_update",
+        "url": "https://www.c-labo.jp/shop/ikebukuro/",
+        "retail_price": 0,
+        "key": "clabo_ikebukuro",
+        "strict_actions": True,
+        "require_keywords": CLABO_REQUIRE_KEYWORDS,
     },
     # ※ポケセンオンライン ニュース一覧(/news/)は監視に入れない。
     #   実査(2026-07-29)の結果、JSレンダリングで静的HTMLから本文を1行も拾えず

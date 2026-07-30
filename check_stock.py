@@ -26,6 +26,7 @@ import requests
 import config
 from email_utils import send_email_with_retry
 from webhook_utils import send_webhook
+from x_post import build_post_block
 
 # --- 分割モジュール（テスト・既存コードの互換のため名前を再輸出する）---
 from netutil import _UNREACHABLE_HOSTS, http_get, fetch
@@ -33,7 +34,7 @@ from rules import (
     _this_year, _upcoming_dates, _normalize_box_name, _deck_supply_rule,
     _is_actionable_line, _expired_pokeca_titles, _mentions_expired,
     match_altema_price, passes_profit, net_proceeds, _item_short_name,
-    extract_lottery_candidate, upcoming_releases,
+    extract_lottery_candidate, upcoming_releases, passes_require_keywords,
 )
 from links import (
     _norm_link_text, _clean_store_url, _unwrap_affiliate, extract_anchors,
@@ -1191,8 +1192,11 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
         strict = bool(item.get("strict_actions"))
         is_pokeca = ("ポケカ" in item["name"]) or ("ポケモン" in item["name"]) or ("pokemon" in item.get("url", ""))
         expired = _expired_pokeca_titles(prev, new_state, today_jst)
+        require = item.get("require_keywords")
         def _notable(l):
-            return _is_actionable_line(l, today_jst, strict, is_pokeca) and not _mentions_expired(l, expired)
+            return (_is_actionable_line(l, today_jst, strict, is_pokeca)
+                    and passes_require_keywords(l, require)
+                    and not _mentions_expired(l, expired))
         links = {}
         for l in lines:
             if _notable(l):
@@ -1470,6 +1474,13 @@ def build_messages(alerts):
             f'<li style="margin-bottom:10px;"><strong>{tag}{item["name"]}</strong>'
             f'{price} {detail}<br><a href="{item["url"]}">{item["url"]}</a></li>'
         )
+    # X投稿用のコピペブロックを末尾に追加（プレーンテキスト側とWebhookのみ。
+    # HTMLメールからのコピーは書式が混ざるため載せない）。
+    # AMAZON_ASSOCIATE_TAG を設定するとAmazonリンクにタグが付き、#PRが自動で入る。
+    x_block = build_post_block(norm, affiliate_tag=os.environ.get("AMAZON_ASSOCIATE_TAG"))
+    text_lines.extend(x_block)
+    web_lines.extend(x_block)
+
     text = "\n".join(text_lines)
     html = (
         '<html><body style="font-family:sans-serif;">'

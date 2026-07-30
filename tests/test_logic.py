@@ -774,3 +774,51 @@ class TestReleaseCalendar(unittest.TestCase):
         titles = [t for _, t, _, _ in out]
         self.assertIn("拡張パック「ストームエメラルダ」", titles)   # 2日後
         self.assertNotIn("「30th CELEBRATION FUTURISTIC BOX」", titles)  # 49日後
+
+
+class TestRequireKeywords(unittest.TestCase):
+    """実店舗ページ用の必須キーワード絞り込み（カードラボ等）。
+
+    店舗ページは全TCGの告知・イベント・定型文が混在するため、行動語だけでは
+    無関係な行が通ってしまう。対象商材名を必須条件にして精度を守る。
+    """
+
+    def setUp(self):
+        import config
+        from datetime import date
+        self.req = config.CLABO_REQUIRE_KEYWORDS
+        self.today = date(2026, 7, 30)
+
+    def _notable(self, line):
+        return (cs._is_actionable_line(line, self.today, True, True)
+                and cs.passes_require_keywords(line, self.req))
+
+    def test_pokeca_lottery_headline_passes(self):
+        self.assertTrue(self._notable(
+            "【抽選予約販売のお知らせ】＜9月16日発売＞ポケモンカードゲーム 30th CELEBRATION【カードラボ池袋店】"))
+
+    def test_other_tcg_event_rejected(self):
+        self.assertFalse(self._notable("【ヴァイスシュヴァルツブラウ】女性限定交流会"))
+
+    def test_generic_reservation_list_rejected(self):
+        """商材名を含まない定型的な予約リスト更新は通知しない。"""
+        self.assertFalse(self._notable("【予約情報】カードラボ池袋店予約受付中商品（7/28更新）"))
+        self.assertFalse(self._notable("商品ご予約について"))
+
+    def test_empty_require_allows_all(self):
+        """require未指定の監視項目は従来動作（絞り込みなし）。"""
+        self.assertTrue(cs.passes_require_keywords("何でも通る", None))
+        self.assertTrue(cs.passes_require_keywords("何でも通る", []))
+
+    def test_tokyo_stores_only(self):
+        """実店舗の監視は東京都内のみ（ユーザー方針 2026-07-30）。"""
+        import config
+        clabo = [i for i in config.WATCH_ITEMS if i["key"].startswith("clabo_")]
+        self.assertEqual(len(clabo), 4)
+        for it in clabo:
+            self.assertTrue(it.get("strict_actions"))
+            self.assertTrue(it.get("require_keywords"))
+        # 大阪等の他地域店舗が混入していないこと
+        urls = " ".join(i["url"] for i in clabo)
+        for other in ("namba", "otaroad", "nipponbashi", "kumamoto"):
+            self.assertNotIn(other, urls)

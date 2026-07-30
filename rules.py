@@ -187,6 +187,20 @@ def _deck_supply_rule(line, is_pokeca, today):
     return False, False
 
 
+def passes_require_keywords(line, require):
+    """require が指定された監視項目では、その語のいずれかを含む行だけを通知対象にする。
+
+    カードラボ等の実店舗ページは1ページに全TCG（遊戯王/ヴァイス/ワンピ…）の告知や
+    イベント・定型文が混在する。行動語（予約/抽選/販売…）だけで絞ると
+    「ヴァイスシュヴァルツ交流会」「商品ご予約について」のような無関係な行まで通ってしまう。
+    → 対象商材の名前を含むことを追加条件にして、通知が来たら本物という精度を守る。
+    require が空/未指定なら常に True（従来動作）。
+    """
+    if not require:
+        return True
+    return any(kw in line for kw in require)
+
+
 def _is_actionable_line(line, today=None, strict=False, is_pokeca=False):
     """追加行が「通知する価値のある実質情報」か判定する。
     (1)再販/入荷/抽選/予約/コラボ/発売等の行動語を含む、または
