@@ -822,3 +822,46 @@ class TestRequireKeywords(unittest.TestCase):
         urls = " ".join(i["url"] for i in clabo)
         for other in ("namba", "otaroad", "nipponbashi", "kumamoto"):
             self.assertNotIn(other, urls)
+
+
+class TestReleaseMilestone(unittest.TestCase):
+    """発売カレンダーの節目再通知（2026-08-19 追加）。
+
+    回帰テスト: 以前は「商品名|発売日」を既知キーにしていたため一度通知した商品は
+    発売が近づいても二度と通知されず、9/16発売の30th商品の応募期間(8/10〜8/14)を
+    取りこぼした。節目をまたぐごとに再通知されることを担保する。
+    """
+
+    def setUp(self):
+        from datetime import date
+        self.rd = date(2026, 9, 16)
+        self.products = {
+            "a": {"title": "「30th CELEBRATION FUTURISTIC BOX」",
+                  "releaseDate": "2026年 9月16日（水）",
+                  "price": "27,500円（税込）", "link": ""},
+        }
+
+    def _run(self, today, seen):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime(today.year, today.month, today.day, 12, 0,
+                       tzinfo=ZoneInfo("Asia/Tokyo"))
+        alerts = []
+        state = {"pokecard_official": ["x"], "_pokecard_raw": self.products}
+        cs.report_release_calendar({"release_seen": seen}, state, alerts, now)
+        return alerts, state.get("release_seen", [])
+
+    def test_renotifies_after_crossing_milestone(self):
+        from datetime import date
+        # 60日節目で通知済み → 28日後(30日節目)には再通知される
+        a1, seen1 = self._run(date(2026, 7, 18), [])
+        self.assertEqual(len(a1), 1)
+        a2, _ = self._run(date(2026, 8, 19), seen1)
+        self.assertEqual(len(a2), 1, "節目をまたいだら再通知されるべき")
+
+    def test_no_duplicate_within_same_milestone(self):
+        from datetime import date
+        a1, seen1 = self._run(date(2026, 8, 19), [])
+        self.assertEqual(len(a1), 1)
+        a2, _ = self._run(date(2026, 8, 20), seen1)
+        self.assertEqual(len(a2), 0, "同じ節目の間は再通知しない")

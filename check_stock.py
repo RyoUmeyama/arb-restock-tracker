@@ -1066,9 +1066,28 @@ def report_release_calendar(prev, new_state, alerts, now_jst):
         seen_prev = prev.get("release_seen")
         first = not isinstance(seen_prev, list)
         seen = list(seen_prev or [])
-        fresh = [u for u in upcoming if f"{u[1]}|{u[0].isoformat()}" not in set(seen)]
+
+        def _milestone(days):
+            """発売までの残日数を節目に丸める。節目をまたぐたびに再通知するためのキー。
+
+            2026-08-19: 以前は「商品名|発売日」を既知キーにしていたため、
+            一度通知した商品は発売が近づいても二度と通知されなかった。
+            実害: 9/16発売の30th商品(FUTURISTIC BOX 27,500円等)は7月に1度通知したきりで、
+            応募が始まる8月に何も知らせず、抽選(8/10〜8/14)を取りこぼした。
+            → 節目(60/30/14/7/3/1日前)ごとに再通知して直前の行動を促す。
+            """
+            for m in config.RELEASE_MILESTONES:
+                if days >= m:
+                    return m
+            return 0
+
+        def _key(u):
+            days = (u[0] - now_jst.date()).days
+            return f"{u[1]}|{u[0].isoformat()}|m{_milestone(days)}"
+
+        fresh = [u for u in upcoming if _key(u) not in set(seen)]
         for u in fresh:
-            seen.append(f"{u[1]}|{u[0].isoformat()}")
+            seen.append(_key(u))
         new_state["release_seen"] = seen[-config.DIGEST_SEEN_KEEP:]
 
         if first:
@@ -1097,6 +1116,60 @@ def report_release_calendar(prev, new_state, alerts, now_jst):
 def _process_item(item, prev, new_state, alerts, health, candidates=None):
     """1監視項目の判定・状態更新・通知起票。run_once から項目ごとに例外隔離されて呼ばれる。"""
     key = item["key"]
+
+    if item.get("method") == "pokecen_news_ids":
+        # ポケセンオンラインの記事ID差分で新着ニュースを検知する。
+        # 経緯(2026-08-19): 抽選応募一覧(/lottery/apply.html)はVueテンプレートで
+        # 中身がJSレンダリングのため、抽選が載っても静的HTMLは変化せず検知できなかった。
+        # 一方ニュース一覧(/news/)は単体では500を返すが、TOPページには記事IDリンクが
+        # 静的HTMLで並び、個別記事(/news/?id=YYYYMMDD)は静的に全文取得できる。
+        # → TOPページから記事IDを拾い、新規IDの本文を取得して判定する。
+        # 実際 8/3 の記事(id=20260803)に抽選日程(8/10〜8/14)が載っていたが取りこぼした。
+        try:
+            resp = http_get(item["url"], allow_redirects=True)
+            html = resp.content.decode("utf-8", errors="replace")
+        except Exception as e:
+            new_state[key] = prev.get(key, [])
+            health["fail"].append((item["name"], item.get("url", "")))
+            print(f"  {item['name']}: 判定不能（前回状態を維持）: {e}")
+            return
+        ids = sorted(set(re.findall(r"news/\?id=(\d{8})", html)), reverse=True)
+        if not ids:
+            new_state[key] = prev.get(key, [])
+            health["fail"].append((item["name"], item.get("url", "")))
+            print(f"  {item['name']}: 記事IDを抽出できず（前回状態を維持）")
+            return
+        health["ok"].append(item["name"])
+        new_state[key] = ids[:60]
+        prev_ids = prev.get(key)
+        if not isinstance(prev_ids, list):
+            print(f"  {item['name']}: 初回・{len(ids)}件を記録（通知なし）")
+            return
+        fresh = [i for i in ids if i not in set(prev_ids)]
+        if not fresh:
+            print(f"  {item['name']}: 新着なし（既知{len(ids)}件）")
+            return
+        require = item.get("require_keywords")
+        details = []
+        for nid in fresh[:5]:
+            url = f"https://www.pokemoncenter-online.com/news/?id={nid}"
+            try:
+                body = http_get(url, allow_redirects=True).content.decode("utf-8", errors="replace")
+                text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(
+                    r"<script.*?</script>", "", body, flags=re.S)))
+            except Exception:
+                text = ""
+            if require and not any(k in text for k in require):
+                continue
+            snippet = text[:400].strip()
+            details.append(f"{nid}: {snippet} {url}")
+        if not details:
+            health["suppressed"] = health.get("suppressed", 0) + 1
+            print(f"  {item['name']}: 新着{len(fresh)}件（対象キーワードなし・通知抑制）")
+            return
+        print(f"  {item['name']}: 新着{len(details)}件検知🔔 ← 通知")
+        alerts.append((item, "\n\n".join(details), "info"))
+        return
 
     if item.get("method") == "pokecard_official_list":
         # ポケカ公式API: (title,releaseDate)セット差分で新商品を検知（初回は基準記録）
