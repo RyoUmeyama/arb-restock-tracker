@@ -865,3 +865,69 @@ class TestReleaseMilestone(unittest.TestCase):
         self.assertEqual(len(a1), 1)
         a2, _ = self._run(date(2026, 8, 20), seen1)
         self.assertEqual(len(a2), 0, "同じ節目の間は再通知しない")
+
+
+class TestPokecenNewsRetry(unittest.TestCase):
+    """記事本文の取得失敗を「既知」にせず次回再試行する（2026-08-19 回帰テスト）。
+
+    失敗したIDを既知化すると、一時的な403/タイムアウトだけで記事が永久に埋もれる。
+    まさに8/3の抽選告知(id=20260803)を取りこぼしたのと同じ形の事故になる。
+    """
+
+    def setUp(self):
+        self.item = {
+            "name": "ポケセンオンライン ニュース（抽選日程の告知）",
+            "method": "pokecen_news_ids",
+            "url": "https://example.test/",
+            "retail_price": 0,
+            "key": "pokecen_news_ids",
+            "require_keywords": ["抽選"],
+        }
+        self._orig = cs.http_get
+
+    def tearDown(self):
+        cs.http_get = self._orig
+
+    def _stub(self, index_ids, body_map):
+        class R:
+            def __init__(self, content):
+                self.content = content
+        def fake(url, **kw):
+            if url == self.item["url"]:
+                html = "".join(f'<a href="/news/?id={i}">x</a>' for i in index_ids)
+                return R(html.encode())
+            nid = url.rsplit("=", 1)[-1]
+            if nid not in body_map:
+                raise RuntimeError("fetch failed")
+            return R(body_map[nid].encode())
+        cs.http_get = fake
+
+    def test_failed_article_is_retried_next_run(self):
+        # 20260803 の本文取得が失敗するケース
+        self._stub(["20260803", "20260801"], {"20260801": "<p>通常のお知らせ 抽選</p>"})
+        prev = {"pokecen_news_ids": ["20260801"]}
+        ns, alerts = {}, []
+        h = {"ok": [], "fail": [], "suppressed": 0}
+        cs._process_item(self.item, prev, ns, alerts, h)
+        self.assertNotIn("20260803", ns["pokecen_news_ids"],
+                         "取得失敗したIDは既知化せず次回再試行できるべき")
+
+    def test_successful_article_is_marked_known(self):
+        self._stub(["20260803"], {"20260803": "<p>30th 抽選 応募期間</p>"})
+        prev = {"pokecen_news_ids": []}
+        ns, alerts = {}, []
+        h = {"ok": [], "fail": [], "suppressed": 0}
+        cs._process_item(self.item, prev, ns, alerts, h)
+        self.assertIn("20260803", ns["pokecen_news_ids"])
+        self.assertEqual(len(alerts), 1)
+
+
+class TestNoZombieMonitor(unittest.TestCase):
+    """検知不能と判明した監視をWATCH_ITEMSに残さない（2026-08-19）。"""
+
+    def test_pokecen_lottery_apply_removed(self):
+        import config
+        keys = [i["key"] for i in config.WATCH_ITEMS]
+        self.assertNotIn("pokecen_lottery_apply", keys,
+                         "JSレンダリングで構造上検知不能。health[ok]に入り健全を偽装する")
+        self.assertIn("pokecen_news_ids", keys, "代替監視は残っているべき")

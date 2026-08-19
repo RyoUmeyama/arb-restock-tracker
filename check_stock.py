@@ -1140,29 +1140,38 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
             print(f"  {item['name']}: 記事IDを抽出できず（前回状態を維持）")
             return
         health["ok"].append(item["name"])
-        new_state[key] = ids[:60]
         prev_ids = prev.get(key)
         if not isinstance(prev_ids, list):
+            new_state[key] = ids[:60]
             print(f"  {item['name']}: 初回・{len(ids)}件を記録（通知なし）")
             return
         fresh = [i for i in ids if i not in set(prev_ids)]
         if not fresh:
+            new_state[key] = ids[:60]
             print(f"  {item['name']}: 新着なし（既知{len(ids)}件）")
             return
         require = item.get("require_keywords")
         details = []
+        # 本文取得に失敗した記事は「既知」にせず次回に再試行する。
+        # ここを既知化すると、一時的な403/タイムアウトだけで記事が永久に埋もれる
+        # （まさに8/3の抽選告知を取りこぼしたのと同じ形の事故になる）。
+        retry_later = []
         for nid in fresh[:5]:
             url = f"https://www.pokemoncenter-online.com/news/?id={nid}"
             try:
                 body = http_get(url, allow_redirects=True).content.decode("utf-8", errors="replace")
                 text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(
                     r"<script.*?</script>", "", body, flags=re.S)))
-            except Exception:
-                text = ""
+            except Exception as e:
+                print(f"    ⚠ 記事{nid}の本文取得に失敗（次回再試行）: {e}")
+                retry_later.append(nid)
+                continue
             if require and not any(k in text for k in require):
                 continue
             snippet = text[:400].strip()
             details.append(f"{nid}: {snippet} {url}")
+        # 取得できなかったIDは既知リストから除外して次回また fresh に載せる
+        new_state[key] = [i for i in ids[:60] if i not in set(retry_later)]
         if not details:
             health["suppressed"] = health.get("suppressed", 0) + 1
             print(f"  {item['name']}: 新着{len(fresh)}件（対象キーワードなし・通知抑制）")
