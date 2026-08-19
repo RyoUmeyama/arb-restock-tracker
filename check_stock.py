@@ -455,16 +455,77 @@ def fetch_onepiece_news():
     return out, bool(out)
 
 
+def auto_watch_items(prev):
+    """動的に監視へ追加された銘柄（state保持）を WATCH_ITEMS 相当の形で返す。
+
+    2026-08-19 追加。従来は新商品が出るたびに config.py を人手で編集しないと
+    監視に入らず、「発見はしたが誰も追加しないまま機会が過ぎる」状態が起きていた。
+    今後も新弾は継続的に出るため、発見したまとめページはそのまま監視対象にする。
+
+    方針の安全弁:
+      - 追加されるのは anime-matsuri の「抽選/予約まとめ」ページのみ（page_update）。
+        在庫の直接判定や購入導線は含まないので、誤登録しても誤発注は起きない。
+      - 上限 AUTO_WATCH_MAX 件。古いものからFIFOで捨てる（暴走防止）。
+      - config.WATCH_ITEMS と URL が重複するものは登録しない（手動定義を優先）。
+    """
+    out = []
+    manual_urls = {i.get("url", "") for i in config.WATCH_ITEMS}
+    for rec in (prev.get("auto_watch") or [])[: config.AUTO_WATCH_MAX]:
+        url = rec.get("url") or ""
+        if not url or url in manual_urls:
+            continue
+        out.append({
+            "name": rec.get("name") or url,
+            "method": "page_update",
+            "url": url,
+            "retail_price": 0,
+            "key": rec["key"],
+            "strict_actions": True,
+        })
+    return out
+
+
+def register_auto_watch(pages, prev, new_state):
+    """発見した抽選まとめページを動的監視リストへ登録する。返り値: 新規登録件数。"""
+    existing = list(prev.get("auto_watch") or [])
+    known = {r.get("url") for r in existing} | {i.get("url", "") for i in config.WATCH_ITEMS}
+    added = 0
+    for slug, pg in pages.items():
+        url = pg.get("url") or ""
+        if not url or url in known:
+            continue
+        existing.append({"key": f"auto_{slug}"[:60], "name": pg.get("title") or slug, "url": url})
+        known.add(url)
+        added += 1
+    # 上限を超えた分は古いものから捨てる
+    if len(existing) > config.AUTO_WATCH_MAX:
+        existing = existing[-config.AUTO_WATCH_MAX:]
+    new_state["auto_watch"] = existing
+    return added
+
+
 def discover_am_lottery_pages():
     """anime-matsuriの新着記事から新しい「抽選予約・再販まとめ」ページを発見する。
     返り値: (pages: dict[slug->{title,url}], ok: bool)。
     新弾のまとめページ（EB-05等）が作られたら監視追加候補として提案するための入力。"""
+    # per_page=50 の1ページ目だけを見ていた頃は、新弾発売時に個別カード紹介記事が
+    # 大量投稿されて まとめページが押し出され、発見が常時0件になっていた（2026-08-19 実測）。
+    # 複数ページ辿って母数を確保する。
+    posts = []
     try:
-        resp = http_get(config.AM_POSTS_API, params={"per_page": "50", "_fields": "slug,link,title"})
-        posts = resp.json()
+        for page in range(1, config.AM_DISCOVERY_PAGES + 1):
+            resp = http_get(config.AM_POSTS_API, params={
+                "per_page": "100", "page": str(page), "_fields": "slug,link,title"})
+            chunk = resp.json()
+            if not chunk:
+                break
+            posts.extend(chunk)
+            time.sleep(config.REQUEST_INTERVAL)
     except Exception as e:
-        print(f"  ⚠ anime-matsuri記事一覧の取得失敗: {e}")
-        return {}, False
+        if not posts:
+            print(f"  ⚠ anime-matsuri記事一覧の取得失敗: {e}")
+            return {}, False
+        print(f"  ⚠ anime-matsuri記事一覧を一部のみ取得: {e}")
     pages = {}
     for p in posts:
         slug = p.get("slug") or ""
@@ -980,6 +1041,11 @@ def append_heartbeat(prev, new_state, alerts, health):
             fresh_pages = {sl: pg for sl, pg in pages.items()
                            if sl not in known and pg["url"] not in watched_urls}
             new_state["am_pages_seen"] = sorted(set(pages) | known)[-300:]
+            # 発見したページはそのまま動的監視へ登録する（人手のconfig編集を不要にする）
+            if config.AUTO_WATCH_ENABLED:
+                n_auto = register_auto_watch(pages, prev, new_state)
+                if n_auto:
+                    print(f"  🤖 動的監視に{n_auto}件を自動登録（次パスから監視開始）")
             first_am = "am_pages_seen" not in prev
             if first_am:
                 print(f"  🔎 抽選まとめページ発見: 初回・{len(pages)}件を記録（通知なし）")
@@ -1411,7 +1477,13 @@ def run_once():
             print(f"  ⚠ 相場選別で想定外エラー（前回状態を維持）: {e}")
     drop_counts = prev.get("drop_counts", {})
 
-    for item in config.WATCH_ITEMS:
+    watch_list = list(config.WATCH_ITEMS)
+    if config.AUTO_WATCH_ENABLED:
+        auto = auto_watch_items(prev)
+        if auto:
+            print(f"  🤖 動的監視 {len(auto)}件を含めて実行")
+        watch_list += auto
+    for item in watch_list:
         key = item["key"]
 
         # Phase3自動除外: 相場選別で「定価割れ」が連続確定した銘柄はチェック自体をスキップ。

@@ -536,6 +536,12 @@ EXCLUDE_TITLE_KEYWORDS = [
 ]
 # 動的監視候補の上限（net利益降順で上位のみ。暴走防止）
 MAX_DISCOVERED_ITEMS = 30
+# --- 動的監視（発見したまとめページを自動で監視対象にする。2026-08-19）---
+# 新商品は今後も継続的に出るため、発見→人手でconfig編集、という導線をなくす。
+# 追加されるのはanime-matsuriの抽選/予約まとめページ(page_update)のみで、
+# 在庫の直接判定や購入導線は含まないため、誤登録しても誤発注は起きない。
+AUTO_WATCH_ENABLED = True
+AUTO_WATCH_MAX = 40            # 動的監視の上限（古いものからFIFOで破棄・暴走防止）
 
 # 東映在庫スイープにも1年半ルールを適用（全商品共通規則）。
 # 旧弾の在庫復活は通知しない（ログには残す）。実在庫シグナルとして通知したくなったら
@@ -546,6 +552,9 @@ TOEI_SWEEP_OLD_ALERT = False
 # 新弾（EB-05等）の「抽選予約・再販入荷まとめ」ページが作られたら、毎朝のヘルスレポートで
 # 監視追加候補として提案する（従来は手動でREST検索して探していた作業の自動化）。
 AM_POSTS_API = "https://anime-matsuri.com/wp-json/wp/v2/posts"
+# 抽選まとめページ発見で辿るAPIページ数（1ページ=100件）。
+# 新弾時は個別カード紹介記事が大量投稿されてまとめページが押し出されるため複数ページ必要。
+AM_DISCOVERY_PAGES = 3
 AM_LOTTERY_SLUG_MARKER = "reservation-lottery"
 # 提案対象のタイトル語（カード商品のみ）
 AM_LOTTERY_TITLE_KEYWORDS = ["ポケモンカード", "ポケカ", "ワンピースカード", "ワンピカード",

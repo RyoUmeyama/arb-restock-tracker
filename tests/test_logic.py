@@ -931,3 +931,51 @@ class TestNoZombieMonitor(unittest.TestCase):
         self.assertNotIn("pokecen_lottery_apply", keys,
                          "JSレンダリングで構造上検知不能。health[ok]に入り健全を偽装する")
         self.assertIn("pokecen_news_ids", keys, "代替監視は残っているべき")
+
+
+class TestAutoWatch(unittest.TestCase):
+    """動的監視: 発見したまとめページを自動で監視対象にする（2026-08-19追加）。
+
+    従来は新商品が出るたびconfig.pyを人手で編集しないと監視に入らず、
+    「発見はしたが誰も追加しないまま機会が過ぎる」状態が起きていた。
+    """
+
+    def test_registers_new_pages(self):
+        pages = {"slug-a": {"title": "新弾A 抽選まとめ", "url": "https://x.test/a"}}
+        ns = {}
+        self.assertEqual(cs.register_auto_watch(pages, {}, ns), 1)
+        self.assertEqual(len(ns["auto_watch"]), 1)
+
+    def test_does_not_duplicate_manual_items(self):
+        import config
+        url = config.WATCH_ITEMS[0]["url"]
+        pages = {"dup": {"title": "重複", "url": url}}
+        ns = {}
+        self.assertEqual(cs.register_auto_watch(pages, {}, ns), 0,
+                         "手動定義と同じURLは登録しない")
+
+    def test_does_not_duplicate_existing_auto(self):
+        prev = {"auto_watch": [{"key": "auto_x", "name": "n", "url": "https://x.test/a"}]}
+        pages = {"x": {"title": "n", "url": "https://x.test/a"}}
+        ns = {}
+        self.assertEqual(cs.register_auto_watch(pages, prev, ns), 0)
+
+    def test_respects_max_cap(self):
+        import config
+        prev = {"auto_watch": [{"key": f"auto_{i}", "name": "n", "url": f"https://x.test/{i}"}
+                               for i in range(config.AUTO_WATCH_MAX)]}
+        pages = {"new": {"title": "新規", "url": "https://x.test/new"}}
+        ns = {}
+        cs.register_auto_watch(pages, prev, ns)
+        self.assertLessEqual(len(ns["auto_watch"]), config.AUTO_WATCH_MAX,
+                             "上限を超えて無限に増えない")
+        self.assertEqual(ns["auto_watch"][-1]["url"], "https://x.test/new",
+                         "新しいものが残りFIFOで古いものが落ちる")
+
+    def test_items_are_page_update_only(self):
+        """動的登録は在庫判定を含まない＝誤登録しても誤発注は起きない。"""
+        prev = {"auto_watch": [{"key": "auto_x", "name": "n", "url": "https://x.test/a"}]}
+        items = cs.auto_watch_items(prev)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["method"], "page_update")
+        self.assertEqual(items[0]["retail_price"], 0)
