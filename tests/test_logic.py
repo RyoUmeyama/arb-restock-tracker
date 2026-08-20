@@ -979,3 +979,60 @@ class TestAutoWatch(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["method"], "page_update")
         self.assertEqual(items[0]["retail_price"], 0)
+
+
+class TestPokecenArticleSummary(unittest.TestCase):
+    """通知メールの本文品質（2026-08-20 回帰テスト）。
+
+    実害: 記事ページ全体をタグ除去して先頭400文字を貼っていたため、
+    メール本文がサイト共通ナビメニュー（またはcookieチェック中間ページのCSS）
+    の壁になり読めなかった。h1/mainの構造抽出＋タイトル行＋<br>変換で直した。
+    """
+
+    ARTICLE = (
+        "<html><head><title>抽選のお知らせ｜公式</title>"
+        "<style>body { color: #000; }</style>"
+        "<script>var x = 1;</script></head><body>"
+        "<nav>ポケモンから探す カテゴリから探す 新商品 ランキング</nav>"
+        "<main>トップページ 30周年記念商品の抽選について "
+        "2026年08月03日（月） <h1>30周年記念商品の抽選について</h1>"
+        "<p>抽選販売を実施いたします。応募期間は8月10日からです。&nbsp;</p></main>"
+        "<footer>ご利用ガイド</footer></body></html>"
+    )
+
+    def test_title_and_body_extracted(self):
+        title, text = cs._pokecen_article_summary(self.ARTICLE)
+        self.assertEqual(title, "30周年記念商品の抽選について")
+        self.assertIn("抽選販売を実施いたします", text)
+
+    def test_boilerplate_excluded(self):
+        _, text = cs._pokecen_article_summary(self.ARTICLE)
+        self.assertNotIn("カテゴリから探す", text, "ナビメニューは本文に含めない")
+        self.assertNotIn("color: #000", text, "CSSソースは本文に含めない")
+        self.assertNotIn("var x", text, "JSソースは本文に含めない")
+
+    def test_interstitial_css_not_leaked(self):
+        # cookieチェック中間ページ（style+noscriptのみ）でもCSSが本文にならない
+        interstitial = (
+            "<html><head><style>body { color: #000; } .alert { padding: 8px; }"
+            "</style></head><body><noscript><p>JavaScriptを有効にしてください</p>"
+            "</noscript></body></html>"
+        )
+        title, text = cs._pokecen_article_summary(interstitial)
+        self.assertIsNone(title)
+        self.assertNotIn("color", text)
+
+    def test_fallback_without_main(self):
+        # 構造が変わってh1/mainが無くても全文フォールバックで動く（既存テストの保証）
+        title, text = cs._pokecen_article_summary("<p>通常のお知らせ 抽選</p>")
+        self.assertIsNone(title)
+        self.assertIn("抽選", text)
+
+    def test_html_mail_preserves_line_breaks(self):
+        item = {"name": "ポケセンオンライン ニュース（抽選日程の告知）",
+                "url": "https://example.test/", "retail_price": 0}
+        detail = "\n■ タイトル（2026/08/03掲載）\n本文の抜粋…\nhttps://example.test/news/?id=20260803"
+        _, text, html, _, _ = cs.build_messages([(item, detail, "info")])
+        self.assertIn("<br>■ タイトル（2026/08/03掲載）<br>本文の抜粋…<br>", html,
+                      "複数行detailはHTMLで<br>に変換され1段落の壁にならない")
+        self.assertIn("\n■ タイトル（2026/08/03掲載）\n", text)

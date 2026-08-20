@@ -1179,6 +1179,33 @@ def report_release_calendar(prev, new_state, alerts, now_jst):
         print(f"  ⚠ 発売カレンダーの算出でエラー（スキップ）: {e}")
 
 
+def _pokecen_article_summary(body):
+    """ポケセンオンラインの記事HTMLから (タイトル, 本文テキスト) を構造で抜く。
+
+    ページ全体をタグ除去して先頭400文字を取ると、ほぼ全部がサイト共通の
+    ナビメニュー（「ポケモンから探す カテゴリから探す…」）になり通知メールが
+    読めない（2026-08-20 実害）。h1＝記事タイトル、main＝記事本体を使い、
+    構造が変わっても壊れないよう、見つからなければページ全体にフォールバックする。
+    """
+    def clean(html):
+        html = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html,
+                      flags=re.S | re.I)
+        html = re.sub(r"<[^>]+>", " ", html)
+        html = html.replace("&nbsp;", " ").replace("&amp;", "&")
+        return re.sub(r"\s+", " ", html).strip()
+
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", body, flags=re.S | re.I)
+    title = clean(m.group(1)) if m else None
+    m = re.search(r"<main[^>]*>(.*?)</main>", body, flags=re.S | re.I)
+    text = clean(m.group(1)) if m else clean(body)
+    # main先頭のパンくず・タイトル重複・掲載日を落として本文から始める
+    text = re.sub(r"^トップページ\s*", "", text)
+    if title and text.startswith(title):
+        text = text[len(title):].lstrip()
+    text = re.sub(r"^\d{4}年\d{1,2}月\d{1,2}日（[^）]*）\s*", "", text)
+    return title, text
+
+
 def _process_item(item, prev, new_state, alerts, health, candidates=None):
     """1監視項目の判定・状態更新・通知起票。run_once から項目ごとに例外隔離されて呼ばれる。"""
     key = item["key"]
@@ -1226,16 +1253,17 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
             url = f"https://www.pokemoncenter-online.com/news/?id={nid}"
             try:
                 body = http_get(url, allow_redirects=True).content.decode("utf-8", errors="replace")
-                text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(
-                    r"<script.*?</script>", "", body, flags=re.S)))
             except Exception as e:
                 print(f"    ⚠ 記事{nid}の本文取得に失敗（次回再試行）: {e}")
                 retry_later.append(nid)
                 continue
-            if require and not any(k in text for k in require):
+            title, text = _pokecen_article_summary(body)
+            if require and not any(k in f"{title or ''} {text}" for k in require):
                 continue
-            snippet = text[:400].strip()
-            details.append(f"{nid}: {snippet} {url}")
+            date_str = (f"{nid[:4]}/{nid[4:6]}/{nid[6:8]}"
+                        if len(nid) == 8 and nid.isdigit() else nid)
+            head = f"■ {title or f'記事{nid}'}（{date_str}掲載）"
+            details.append(f"{head}\n{text[:300].strip()}…\n{url}")
         # 取得できなかったIDは既知リストから除外して次回また fresh に載せる
         new_state[key] = [i for i in ids[:60] if i not in set(retry_later)]
         if not details:
@@ -1243,7 +1271,8 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
             print(f"  {item['name']}: 新着{len(fresh)}件（対象キーワードなし・通知抑制）")
             return
         print(f"  {item['name']}: 新着{len(details)}件検知🔔 ← 通知")
-        alerts.append((item, "\n\n".join(details), "info"))
+        # 先頭に改行を置き、メールで商品名の行と記事詳細を分ける
+        alerts.append((item, "\n" + "\n\n".join(details), "info"))
         return
 
     if item.get("method") == "pokecard_official_list":
@@ -1624,9 +1653,12 @@ def build_messages(alerts):
         text_lines.append("")
         web_lines.append("・" + line)
         web_lines.append(item["url"])
+        # detailが複数行（ニュース本文・発売カレンダー等）の場合、HTMLでは
+        # 改行が潰れて1段落の壁になるため <br> に変換する
+        html_detail = detail.replace("\n", "<br>")
         html_rows.append(
             f'<li style="margin-bottom:10px;"><strong>{tag}{item["name"]}</strong>'
-            f'{price} {detail}<br><a href="{item["url"]}">{item["url"]}</a></li>'
+            f'{price} {html_detail}<br><a href="{item["url"]}">{item["url"]}</a></li>'
         )
     # X投稿用のコピペブロックを末尾に追加（プレーンテキスト側とWebhookのみ。
     # HTMLメールからのコピーは書式が混ざるため載せない）。
