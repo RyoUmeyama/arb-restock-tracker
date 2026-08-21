@@ -1001,7 +1001,8 @@ def append_heartbeat(prev, new_state, alerts, health):
         "retail_price": 0,
     }
     print("  📊 日次ヘルスレポートを送信")
-    alerts.append((hb_item, " ／ ".join(lines), "info"))
+    # 1情報=1行（「 ／ 」1行連結はメールで壁になる。2026-08-21統一）
+    alerts.append((hb_item, "\n" + "\n".join("・" + l for l in lines), "info"))
 
     # 応募/予約チャンス・ダイジェスト（ヘルスレポートと同じ朝1回に同梱）。
     # 「再販の瞬間を待つ」だけでは通知は稀にしか来ない。締切が先にある抽選・予約は

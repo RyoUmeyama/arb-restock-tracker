@@ -1050,3 +1050,16 @@ class TestPokecenArticleSummary(unittest.TestCase):
         self.assertIn("<br>■ タイトル（2026/08/03掲載）<br>本文の抜粋…<br>", html,
                       "複数行detailはHTMLで<br>に変換され1段落の壁にならない")
         self.assertIn("\n■ タイトル（2026/08/03掲載）\n", text)
+
+
+def test_heartbeat_detail_is_multiline():
+    """日次ヘルスレポートも1情報=1行（壁形式に戻らない。2026-08-21統一の回帰）。"""
+    ns, alerts = {}, []
+    cs.append_heartbeat({}, ns, alerts, {"ok": ["a", "b"], "fail": [("c", "https://x/")], "suppressed": 0})
+    hb = [a for a in alerts if "ヘルス" in a[0]["name"]]
+    if not hb:  # JST9時前は送信されない仕様のためスキップ相当
+        return
+    detail = hb[0][1]
+    assert detail.startswith("\n・")
+    assert " ／ " not in detail
+    assert "\n・このレポートが毎朝届いていれば" in detail
