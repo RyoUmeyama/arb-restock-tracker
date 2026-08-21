@@ -603,7 +603,21 @@ class TestProcessItemPageUpdate(unittest.TestCase):
         ns, alerts, h = self._run(("new", ["【ヨドバシ】抽選受付開始 7月20日まで"], True, "<html>"), prev)
         self.assertEqual(len(alerts), 1)
         self.assertIn("ヨドバシ", alerts[0][1])
-        self.assertIn("→", alerts[0][1])  # リンク（検索フォールバック含む）付き
+        self.assertIn("検索: ", alerts[0][1])  # リンク（検索フォールバック含む）付き
+
+    def test_detail_is_block_format_not_wall(self):
+        """通知本文は「■見出し＋URL行」のブロック形式（2026-08-21 読みにくさ修正の回帰）。
+
+        全告知を「 ／ 」で1行に繋ぐと、メールが読めない壁になっていた。
+        """
+        prev = {"test_pu": {"sig": "old", "lines": [], "links": {}}}
+        two = ["【ヨドバシ】抽選受付開始 7月20日まで", "【ビックカメラ】抽選受付 7月22日から"]
+        ns, alerts, h = self._run(("new", two, True, "<html>"), prev)
+        detail = alerts[0][1]
+        self.assertIn("■ 【ヨドバシ】", detail)
+        self.assertIn("\n\n■ 【ビックカメラ】", detail, "告知ごとに空行で区切られたブロック")
+        self.assertNotIn(" ／ ", detail, "1行連結の壁形式に戻っていない")
+        self.assertIn("（新規2行）", detail)
 
     def test_noise_change_suppressed(self):
         prev = {"test_pu": {"sig": "old", "lines": [], "links": {}}}

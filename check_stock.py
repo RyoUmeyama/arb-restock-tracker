@@ -720,11 +720,11 @@ def run_discovery(prev, new_state, alerts):
                     store_url = resolve_store_link_from_article(art_html, title)
                 except Exception as e:
                     print(f"  ⚠ 記事ページ取得失敗（{lk[:40]}）: {e}")
-                dest = store_url or f"検索:{fallback_search_url(title, {'name': title})}"
-                lines.append(f"{title[:60]} →{dest}（記事:{lk}）")
+                dest = store_url or f"検索: {fallback_search_url(title, {'name': title})}"
+                lines.append(f"■ {title[:60]}\n  {dest}\n  記事: {lk}")
             # 発見通知用の疑似item
             disco_item = {"name": "新弾・再販を発見（RSS）", "url": config.FEED_URLS[0], "retail_price": 0}
-            alerts.append((disco_item, "新規発見: " + " ／ ".join(lines), "info"))
+            alerts.append((disco_item, "\n" + "\n\n".join(lines), "info"))
         else:
             print(f"  RSS発見器: 新規なし（既知{len(discovered)}件）")
 
@@ -1299,10 +1299,11 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
                 names = "、".join(products[k]["title"] for k in fresh[:5])
                 print(f"  {item['name']}: 新商品{len(fresh)}件検知🔔 ← 通知（{names}）")
                 detail_lines = []
-                for k in fresh:
+                for k in fresh[:5]:
                     p = products[k]
-                    detail_lines.append(f"{p['title']}（{p['releaseDate']} {p['price']}）{p['link']}")
-                alerts.append((item, "ポケカ新商品: " + " / ".join(detail_lines[:5]), "info"))
+                    detail_lines.append(
+                        f"■ {p['title']}（{p['releaseDate']} {p['price']}）\n  {p['link']}")
+                alerts.append((item, "\n" + "\n\n".join(detail_lines), "info"))
             else:
                 print(f"  {item['name']}: 新商品なし（{len(cur_keys)}商品）")
         return
@@ -1403,18 +1404,22 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
                         c["source_url"] = links.get(l) or item.get("url", "")
                         c["detected_at"] = today_jst.isoformat()
                         candidates.append(c)
+            # 1告知=「■見出し行＋URL行」のブロック。全告知を「 ／ 」で1行に繋ぐと
+            # メールが読めない壁になる（2026-08-21 実害）。改行はbuild_messagesが
+            # HTMLでは<br>に変換する
             shown = []
             for l in actionable[: config.DIFF_LINES_SHOWN]:
-                entry = l[: config.DIFF_LINE_MAXLEN]
+                entry = f"■ {l[: config.DIFF_LINE_MAXLEN]}"
                 if links.get(l):
-                    entry += f" →{links[l]}"  # 確実な直リンク
+                    entry += f"\n  {links[l]}"  # 確実な直リンク
                 else:
                     # 直リンクが確実に取れない場合はストア検索URL（商品名入り）を付ける。
                     # 集約ページのURLだけでは行動につながらないため。
-                    entry += f" →検索:{fallback_search_url(l, item)}"
+                    entry += f"\n  検索: {fallback_search_url(l, item)}"
                 shown.append(entry)
-            more = f" …ほか{len(actionable) - len(shown)}行" if len(actionable) > len(shown) else ""
-            detail = f"更新検知・新規{len(actionable)}行: " + " ／ ".join(shown) + more
+            more = (f"\n\n…ほか{len(actionable) - len(shown)}行"
+                    if len(actionable) > len(shown) else "")
+            detail = f"\n（新規{len(actionable)}行）\n" + "\n\n".join(shown) + more
             print(f"  {item['name']}: 告知更新を検知🔔 ← 通知（実質{len(actionable)}行/新規{len(added)}行）")
             alerts.append((item, detail, "info"))
         else:
