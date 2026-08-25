@@ -1093,3 +1093,66 @@ class TestAggregatePageBannerNoise(unittest.TestCase):
         # 具体的な店舗×商品×行動の行は引き続き通知される（過剰除外していない）
         self.assertTrue(cs._is_actionable_line(
             "楽天ブックスにてフュージョンワールド CROSS FORCE BOXが再販開始"))
+
+
+class TestDiscoveryFallbackAndAlarm(unittest.TestCase):
+    """自動発見の403フォールバックとサイレント故障防止（2026-08-25 実害の回帰）。
+
+    記事APIがActionsのIPから403になり、8/19の実装以来「新弾まとめページの
+    自動発見・自動監視」が本番で一度も動いていなかった（ログに⚠が出るだけで沈黙）。
+    """
+
+    CATEGORY_HTML = (
+        '<a href="https://anime-matsuri.com/pokemoncard-mega-brave-reservation-lottery/">'
+        '<span>抽選販売・予約</span>\n'
+        'ポケモンカード 拡張パック「メガブレイブ」の抽選予約や先着販売や入荷情報まとめ</a>'
+        '<a href="https://anime-matsuri.com/lorcana-rise-reservation-lottery/">'
+        '<span>抽選販売・予約</span>\nディズニー ロルカナ ブースターパックの抽選予約まとめ</a>'
+    )
+
+    def _stub_http(self, api_fails):
+        import requests as rq
+        def fake(url, **kw):
+            class R:
+                text = self.CATEGORY_HTML
+                def json(self_inner):
+                    raise AssertionError("API側は失敗する想定")
+            if "wp-json" in url:
+                if api_fails:
+                    raise rq.HTTPError("403 Client Error: Forbidden")
+                raise AssertionError("このテストではAPIは呼ばれない想定")
+            return R()
+        return fake
+
+    def test_fallback_to_category_on_api_403(self):
+        orig, orig_sleep = cs.http_get, cs.time.sleep
+        cs.http_get, cs.time.sleep = self._stub_http(api_fails=True), lambda s: None
+        try:
+            pages, ok = cs.discover_am_lottery_pages()
+        finally:
+            cs.http_get, cs.time.sleep = orig, orig_sleep
+        self.assertTrue(ok)
+        self.assertIn("pokemoncard-mega-brave-reservation-lottery", pages)
+        self.assertIn("メガブレイブ", pages["pokemoncard-mega-brave-reservation-lottery"]["title"])
+        # 対象外カード（ロルカナ）はタイトル語フィルタで登録しない
+        self.assertNotIn("lorcana-rise-reservation-lottery", pages)
+
+    def test_failure_streak_alerts_on_third_day(self):
+        state = {}
+        alerts = []
+        for day in range(1, 4):
+            prev, state = state, {}
+            cs._track_discovery_failure(prev, state, alerts)
+        self.assertEqual(state["am_discovery_fail_streak"], 3)
+        self.assertEqual(len(alerts), 1, "3日連続失敗でちょうど1回警告する")
+        self.assertIn("自動発見", alerts[0][0]["name"])
+
+    def test_no_alert_before_third_day(self):
+        state, alerts = {}, []
+        cs._track_discovery_failure({}, state, alerts)
+        self.assertEqual(alerts, [])
+
+    def test_heartbeat_carries_auto_watch(self):
+        # 非発火パスで auto_watch が消える潜在バグの回帰（動的監視リストの保持）
+        self.assertIn("auto_watch", cs.HEARTBEAT_CARRY_KEYS)
+        self.assertIn("am_discovery_fail_streak", cs.HEARTBEAT_CARRY_KEYS)

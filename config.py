@@ -552,6 +552,12 @@ TOEI_SWEEP_OLD_ALERT = False
 # 新弾（EB-05等）の「抽選予約・再販入荷まとめ」ページが作られたら、毎朝のヘルスレポートで
 # 監視追加候補として提案する（従来は手動でREST検索して探していた作業の自動化）。
 AM_POSTS_API = "https://anime-matsuri.com/wp-json/wp/v2/posts"
+# APIがGitHub ActionsのIPから403のときのフォールバック（2026-08-25発見: 8/19の実装以来
+# 本番では毎朝403で自動発見が全滅していた。ローカルでは通るためテストで気づけなかった）。
+# 通常HTMLページはActionsから到達できるため、まとめ専用カテゴリの一覧ページを使う
+# （サイトマップはrobots.txtに記載があるが404＝無効化されている）
+AM_CATEGORY_URL = "https://anime-matsuri.com/category/reservation-lottery/"
+AM_CATEGORY_PAGES = 2  # 一覧を辿るページ数（1ページ≈20件）
 # 抽選まとめページ発見で辿るAPIページ数（1ページ=100件）。
 # 新弾時は個別カード紹介記事が大量投稿されてまとめページが押し出されるため複数ページ必要。
 AM_DISCOVERY_PAGES = 3

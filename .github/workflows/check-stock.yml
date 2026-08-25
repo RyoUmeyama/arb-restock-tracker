@@ -28,6 +28,10 @@ on:
         description: '1にするとテスト通知を1本送って通知経路(Secrets)を確認'
         required: false
         default: '0'
+      debug_discovery:
+        description: '1にすると自動発見だけ実行しActionsからの到達性を検証'
+        required: false
+        default: '0'
 
 concurrency:
   group: gunpla-restock
@@ -72,6 +76,8 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           # 手動実行時に test_notify=1 を渡すと通知経路テストモードになる
           TEST_NOTIFY: ${{ github.event.inputs.test_notify }}
+          # 手動実行時に debug_discovery=1 で自動発見の到達性検証のみ実行
+          DEBUG_DISCOVERY: ${{ github.event.inputs.debug_discovery }}
           # 【2026-07-06 カバレッジ拡大】cronは15分指定でも実測60〜90分間隔（深夜は最大4.5時間）
           # に間引かれると週末の実測で判明。1起動を約60分粘る設計にして間引きの隙間を埋める:
           # 8パス×7分間隔≈1時間。concurrencyグループで同時実行は防がれ、待機中のcronが

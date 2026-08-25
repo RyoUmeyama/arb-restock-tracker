@@ -504,6 +504,33 @@ def register_auto_watch(pages, prev, new_state):
     return added
 
 
+def _discover_from_category():
+    """自動発見のフォールバック: まとめ専用カテゴリの一覧HTMLから記事を拾う。
+
+    記事API(wp-json)はGitHub ActionsのIPから403になる（2026-08-25発見。通常ページの
+    取得は通るのにAPIだけWAFで遮断される）。カテゴリ一覧は通常HTMLなので到達できる。
+    APIパスと同じタイトル語フィルタを適用する（ロルカナ等の非対象カードを登録しない）。
+    """
+    pages = {}
+    for i in range(config.AM_CATEGORY_PAGES):
+        suffix = "" if i == 0 else f"page/{i + 1}/"
+        resp = http_get(config.AM_CATEGORY_URL + suffix)
+        time.sleep(config.REQUEST_INTERVAL)
+        for m in re.finditer(
+                r'<a href="(https://anime-matsuri\.com/([^"/]*'
+                + re.escape(config.AM_LOTTERY_SLUG_MARKER) + r'[^"/]*)/)"[^>]*>(.*?)</a>',
+                resp.text, re.S):
+            url, slug, inner = m.group(1), m.group(2), m.group(3)
+            # アンカー内はカテゴリ名等が混ざるため、最長の行を記事タイトルとみなす
+            lines = [l.strip() for l in re.sub(r"<[^>]+>", "\n", inner).splitlines() if l.strip()]
+            title = max(lines, key=len) if lines else ""
+            if not any(kw in title for kw in config.AM_LOTTERY_TITLE_KEYWORDS):
+                continue
+            if slug not in pages or len(title) > len(pages[slug]["title"]):
+                pages[slug] = {"title": title, "url": url}
+    return pages, bool(pages)
+
+
 def discover_am_lottery_pages():
     """anime-matsuriの新着記事から新しい「抽選予約・再販まとめ」ページを発見する。
     返り値: (pages: dict[slug->{title,url}], ok: bool)。
@@ -523,8 +550,12 @@ def discover_am_lottery_pages():
             time.sleep(config.REQUEST_INTERVAL)
     except Exception as e:
         if not posts:
-            print(f"  ⚠ anime-matsuri記事一覧の取得失敗: {e}")
-            return {}, False
+            print(f"  ⚠ anime-matsuri記事API取得失敗（カテゴリ一覧で代替）: {e}")
+            try:
+                return _discover_from_category()
+            except Exception as e2:
+                print(f"  ⚠ カテゴリ一覧も取得失敗: {e2}")
+                return {}, False
         print(f"  ⚠ anime-matsuri記事一覧を一部のみ取得: {e}")
     pages = {}
     for p in posts:
@@ -953,16 +984,41 @@ def extract_opportunities(prev, new_state, today):
     return out
 
 
+# append_heartbeat が非発火パスでも prev から引き継ぐ状態キー
+HEARTBEAT_CARRY_KEYS = ("last_heartbeat", "digest_seen", "suggested_seen",
+                        "am_pages_seen", "auto_watch", "am_discovery_fail_streak")
+
+
+def _track_discovery_failure(prev, new_state, alerts):
+    """まとめページ自動発見の連続失敗を数え、3日連続でメール警告する。
+
+    2026-08-25 実害: API 403で自動発見が8/19から毎朝失敗していたが、ログに⚠が出る
+    だけで誰も気づかなかった（血統収集と同型のサイレント故障）。「新弾が監視に
+    入らない状態」は取り残しに直結するため、失敗が続いたら本人に届くようにする。
+    """
+    streak = int(prev.get("am_discovery_fail_streak") or 0) + 1
+    new_state["am_discovery_fail_streak"] = streak
+    print(f"  ⚠ まとめページ自動発見 連続失敗{streak}日目")
+    if streak == 3:
+        alerts.append((
+            {"name": "⚠ まとめページ自動発見が3日連続失敗（新弾が監視に入らない状態）",
+             "url": "https://github.com/RyoUmeyama/arb-restock-tracker/actions",
+             "retail_price": 0},
+            "\nanime-matsuri記事一覧の取得（API・サイトマップとも）が3日連続で失敗しています。"
+            "\n新弾のまとめページが自動で監視に追加されない状態です。実行ログの確認が必要です。",
+            "info"))
+
+
 def append_heartbeat(prev, new_state, alerts, health):
     """日次ヘルスレポート: JST9時以降の最初のパスで、Bot生存＋監視状態サマリを1通送る。
     「沈黙が『検知なし』なのか『Bot停止』なのか分からない」問題への対策
     （過去にActions枠切れで3週間気づかず停止していた教訓）。"""
     now_jst = datetime.now(ZoneInfo("Asia/Tokyo"))
     today = now_jst.strftime("%Y-%m-%d")
-    new_state["last_heartbeat"] = prev.get("last_heartbeat")
-    new_state["digest_seen"] = prev.get("digest_seen")  # 非発火パスでも既知チャンスを維持する
-    new_state["suggested_seen"] = prev.get("suggested_seen")
-    new_state["am_pages_seen"] = prev.get("am_pages_seen")
+    # 非発火パスでも維持する状態キー。auto_watch を含め忘れると、ヘルスレポート以外の
+    # パスで保存のたびに動的監視リストが消える（2026-08-25 発見の潜在バグ）
+    for carry_key in HEARTBEAT_CARRY_KEYS:
+        new_state[carry_key] = prev.get(carry_key)
     if now_jst.hour < 9 or prev.get("last_heartbeat") == today:
         return
     new_state["last_heartbeat"] = today
@@ -1036,7 +1092,10 @@ def append_heartbeat(prev, new_state, alerts, health):
     # 新弾のまとめページが作られたら監視追加候補として提案する（手動REST検索の自動化）。
     try:
         pages, ok_am = discover_am_lottery_pages()
+        if not ok_am:
+            _track_discovery_failure(prev, new_state, alerts)
         if ok_am:
+            new_state["am_discovery_fail_streak"] = 0
             known = set(prev.get("am_pages_seen") or [])
             watched_urls = {it.get("url", "") for it in config.WATCH_ITEMS}
             fresh_pages = {sl: pg for sl, pg in pages.items()
@@ -1065,6 +1124,7 @@ def append_heartbeat(prev, new_state, alerts, health):
                 print("  🔎 新しい抽選まとめページなし")
     except Exception as e:
         print(f"  ⚠ 抽選まとめページ発見でエラー（スキップ）: {e}")
+        _track_discovery_failure(prev, new_state, alerts)
 
     # 監視追加候補の自動提案（altema相場ベース・提案済みは再提案しない）。
     # 監視リストが市場の移り変わりで古びるのを防ぐ（アビスアイ等の見落とし再発防止）。
@@ -1598,6 +1658,16 @@ def main():
         }
         notify([(test_item, "Secrets再登録後の疎通確認。届けばメール/Discordとも正常。", "stock")])
         print("=== テスト送信 完了 ===")
+        return
+
+    # DEBUG_DISCOVERY=1: 自動発見だけを実行して結果を表示する（Actions環境からの
+    # 到達性検証用。2026-08-25のAPI 403のような環境依存の故障はローカルで再現できない）
+    if os.environ.get("DEBUG_DISCOVERY") == "1":
+        print("=== DEBUG_DISCOVERY: まとめページ自動発見の到達性検証 ===")
+        pages, ok = discover_am_lottery_pages()
+        print(f"ok={ok} 発見{len(pages)}件")
+        for slug, pg in pages.items():
+            print(f"  - {pg['title'][:60]} {pg['url']}")
         return
 
     loop_count = int(os.environ.get("LOOP_COUNT", "1"))
