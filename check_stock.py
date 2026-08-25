@@ -1240,6 +1240,13 @@ def report_release_calendar(prev, new_state, alerts, now_jst):
         print(f"  ⚠ 発売カレンダーの算出でエラー（スキップ）: {e}")
 
 
+# ポケセン記事の定型挨拶文（全記事共通で情報ゼロ。snippetの文字数枠を食い潰すので落とす）
+POKECEN_BOILERPLATE_PREFIXES = (
+    "平素より", "ご不便をおかけ", "ご理解のほど", "お買い物にあたり",
+    "今後とも", "何卒よろしく",
+)
+
+
 def _pokecen_article_summary(body):
     """ポケセンオンラインの記事HTMLから (タイトル, 本文テキスト) を構造で抜く。
 
@@ -1247,24 +1254,66 @@ def _pokecen_article_summary(body):
     ナビメニュー（「ポケモンから探す カテゴリから探す…」）になり通知メールが
     読めない（2026-08-20 実害）。h1＝記事タイトル、main＝記事本体を使い、
     構造が変わっても壊れないよう、見つからなければページ全体にフォールバックする。
+
+    本文は改行構造を保って返す（2026-08-25改善）。全部を1行に潰すと、記事内の
+    「【再販売予定の商品について】■8月27日 ・商品名」のような見出し・箇条書きが
+    メール上で崩れて見える。定型挨拶文の行は落とす。
     """
-    def clean(html):
+    def clean_inline(html):
         html = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html,
                       flags=re.S | re.I)
         html = re.sub(r"<[^>]+>", " ", html)
         html = html.replace("&nbsp;", " ").replace("&amp;", "&")
         return re.sub(r"\s+", " ", html).strip()
 
+    def clean_block(html):
+        html = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html,
+                      flags=re.S | re.I)
+        # ブロック要素の閉じと<br>を改行として残し、記事内の構造を保つ
+        html = re.sub(r"<(?:br|/p|/div|/li|/h\d|/tr)[^>]*>", "\n", html, flags=re.I)
+        html = re.sub(r"<[^>]+>", " ", html)
+        html = html.replace("&nbsp;", " ").replace("&amp;", "&")
+        lines = [re.sub(r"\s+", " ", l).strip() for l in html.splitlines()]
+        return "\n".join(l for l in lines if l)
+
     m = re.search(r"<h1[^>]*>(.*?)</h1>", body, flags=re.S | re.I)
-    title = clean(m.group(1)) if m else None
+    title = clean_inline(m.group(1)) if m else None
     m = re.search(r"<main[^>]*>(.*?)</main>", body, flags=re.S | re.I)
-    text = clean(m.group(1)) if m else clean(body)
-    # main先頭のパンくず・タイトル重複・掲載日を落として本文から始める
-    text = re.sub(r"^トップページ\s*", "", text)
-    if title and text.startswith(title):
-        text = text[len(title):].lstrip()
-    text = re.sub(r"^\d{4}年\d{1,2}月\d{1,2}日（[^）]*）\s*", "", text)
-    return title, text
+    text = clean_block(m.group(1)) if m else clean_block(body)
+    # 先頭のパンくず・タイトル重複・掲載日・定型挨拶文を落として本文から始める
+    kept = []
+    for i, line in enumerate(text.splitlines()):
+        if line == "トップページ" or (title and line == title):
+            continue
+        if re.fullmatch(r"\d{4}年\d{1,2}月\d{1,2}日（[^）]*）", line):
+            continue
+        if line.startswith(POKECEN_BOILERPLATE_PREFIXES):
+            continue
+        # 行頭に「トップページ タイトル 日付」が1行で来る形にも対応
+        if i == 0:
+            line = re.sub(r"^トップページ\s*", "", line)
+            if title and line.startswith(title):
+                line = line[len(title):].lstrip()
+            line = re.sub(r"^\d{4}年\d{1,2}月\d{1,2}日（[^）]*）\s*", "", line)
+            if not line or line.startswith(POKECEN_BOILERPLATE_PREFIXES):
+                continue
+        kept.append(line)
+    return title, "\n".join(kept)
+
+
+def _snippet_lines(text, budget):
+    """複数行テキストを行の区切りを保ったまま文字数上限まで切り出す。"""
+    out, used = [], 0
+    for line in text.splitlines():
+        if used + len(line) > budget:
+            if not out:  # 1行目から超過する場合は行の途中で切る
+                out.append(line[:budget] + "…")
+            else:
+                out.append("…")
+            break
+        out.append(line)
+        used += len(line)
+    return "\n".join(out)
 
 
 def _process_item(item, prev, new_state, alerts, health, candidates=None):
@@ -1324,7 +1373,10 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
             date_str = (f"{nid[:4]}/{nid[4:6]}/{nid[6:8]}"
                         if len(nid) == 8 and nid.isdigit() else nid)
             head = f"■ {title or f'記事{nid}'}（{date_str}掲載）"
-            details.append(f"{head}\n{text[:300].strip()}…\n{url}")
+            # 本文は記事内の改行構造を保ち、2スペース字下げでヘッダ行と区別する
+            snippet = _snippet_lines(text, 500)
+            indented = "\n".join("  " + l for l in snippet.splitlines())
+            details.append(f"{head}\n{indented}\n{url}")
         # 取得できなかったIDは既知リストから除外して次回また fresh に載せる
         new_state[key] = [i for i in ids[:60] if i not in set(retry_later)]
         if not details:
@@ -1724,17 +1776,24 @@ def build_messages(alerts):
         tag = "【在庫】" if kind == "stock" else "【お知らせ】"
         price = f"（定価{item['retail_price']:,}円）" if item.get("retail_price") else ""
         line = f"{tag}{item['name']}{price} {detail}"
+        # detail内に個別URL（記事リンク等）が含まれる監視は、監視元URLの行を重ねない
+        # （記事URLの直下にトップページURLが並び、崩れて見える。2026-08-25）
+        show_item_url = not item.get("suppress_item_url")
         text_lines.append("・" + line)
-        text_lines.append(f"  {item['url']}")
+        if show_item_url:
+            text_lines.append(f"  {item['url']}")
         text_lines.append("")
         web_lines.append("・" + line)
-        web_lines.append(item["url"])
+        if show_item_url:
+            web_lines.append(item["url"])
         # detailが複数行（ニュース本文・発売カレンダー等）の場合、HTMLでは
         # 改行が潰れて1段落の壁になるため <br> に変換する
         html_detail = detail.replace("\n", "<br>")
+        html_url = (f'<br><a href="{item["url"]}">{item["url"]}</a>'
+                    if show_item_url else "")
         html_rows.append(
             f'<li style="margin-bottom:10px;"><strong>{tag}{item["name"]}</strong>'
-            f'{price} {html_detail}<br><a href="{item["url"]}">{item["url"]}</a></li>'
+            f'{price} {html_detail}{html_url}</li>'
         )
     # X投稿用のコピペブロックを末尾に追加（プレーンテキスト側とWebhookのみ。
     # HTMLメールからのコピーは書式が混ざるため載せない）。

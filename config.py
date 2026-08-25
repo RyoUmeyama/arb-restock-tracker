@@ -400,7 +400,9 @@ WATCH_ITEMS = [
         "url": "https://www.pokemoncenter-online.com/",
         "retail_price": 0,
         "key": "pokecen_news_ids",
-        "require_keywords": ["抽選", "予約", "受付", "応募", "先着"],
+        "require_keywords": ["抽選", "予約", "受付", "応募", "先着", "再販"],
+        # detailに記事URLを含むため、監視元(トップページ)URLの行は重ねない
+        "suppress_item_url": True,
     },
     # ※ポケセンオンライン ニュース一覧(/news/)そのものは監視に入れない。
     #   実査(2026-07-29)の結果、JSレンダリングで静的HTMLから本文を1行も拾えず

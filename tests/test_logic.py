@@ -1156,3 +1156,54 @@ class TestDiscoveryFallbackAndAlarm(unittest.TestCase):
         # 非発火パスで auto_watch が消える潜在バグの回帰（動的監視リストの保持）
         self.assertIn("auto_watch", cs.HEARTBEAT_CARRY_KEYS)
         self.assertIn("am_discovery_fail_streak", cs.HEARTBEAT_CARRY_KEYS)
+
+
+class TestPokecenArticleStructure(unittest.TestCase):
+    """記事本文の構造保持と定型文除去（2026-08-25「本文が崩れて見える」の回帰）。
+
+    実害: 記事内の「【再販売予定の商品について】■8月27日 ・商品名」を全部1行に
+    潰していたため崩れて見え、冒頭の定型挨拶が文字数枠を食い潰して肝心の
+    商品リストが「・ポケモン…」で切れていた。
+    """
+
+    ARTICLE = (
+        "<html><body><main><h1>8月27日の再販売について</h1>"
+        "<p>平素よりポケモンセンターオンラインをご利用いただき、誠にありがとうございます。</p>"
+        "<p>ご不便をおかけいたしますが、ご理解のほど、どうぞよろしくお願いいたします。</p>"
+        "<p>【再販売予定の商品について】</p>"
+        "<p>■8月27日（木）再販売</p>"
+        "<p>・ポケモンカードゲーム カードイラストフィギュアコレクション</p>"
+        "</main></body></html>"
+    )
+
+    def test_structure_preserved_as_lines(self):
+        title, text = cs._pokecen_article_summary(self.ARTICLE)
+        lines = text.splitlines()
+        self.assertIn("【再販売予定の商品について】", lines)
+        self.assertIn("・ポケモンカードゲーム カードイラストフィギュアコレクション", lines)
+
+    def test_boilerplate_greeting_dropped(self):
+        _, text = self._summary()
+        self.assertNotIn("平素より", text)
+        self.assertNotIn("ご不便をおかけ", text)
+
+    def _summary(self):
+        return cs._pokecen_article_summary(self.ARTICLE)
+
+    def test_snippet_cuts_at_line_boundary(self):
+        text = "1行目です\n2行目はとても長い" + "あ" * 100 + "\n3行目"
+        out = cs._snippet_lines(text, 30)
+        self.assertEqual(out.splitlines()[0], "1行目です")
+        self.assertTrue(out.endswith("…"))
+        self.assertNotIn("3行目", out)
+
+    def test_suppress_item_url(self):
+        item = {"name": "ポケセンオンライン ニュース（抽選日程の告知）",
+                "url": "https://www.pokemoncenter-online.com/", "retail_price": 0,
+                "suppress_item_url": True}
+        detail = "\n■ 記事（2026/08/25掲載）\n  本文\nhttps://example.test/news/?id=20260825"
+        _, text, html, _, _ = cs.build_messages([(item, detail, "info")])
+        body = text.split("X投稿用")[0]  # X投稿ブロックは対象外
+        self.assertNotIn("\n  https://www.pokemoncenter-online.com/", body,
+                         "記事URLの直下に監視元URLを重ねない")
+        self.assertNotIn('<a href="https://www.pokemoncenter-online.com/"', html)
