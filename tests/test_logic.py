@@ -1063,3 +1063,33 @@ def test_heartbeat_detail_is_multiline():
     assert detail.startswith("\n・")
     assert " ／ " not in detail
     assert "\n・このレポートが毎朝届いていれば" in detail
+
+
+class TestAggregatePageBannerNoise(unittest.TestCase):
+    """nyuka-now集約ページの状態バナー・地の文を通知しない（2026-08-21 実害の回帰）。
+
+    「【在庫あり】…各種を再販実施中のストア」はページ見出しで、【在庫あり】⇄【在庫なし】の
+    切替のたびに diff の新規行になり、店舗も商品も日時もない通知が届いていた。
+    """
+
+    def test_status_banner_rejected(self):
+        line = "【在庫あり】ドラゴンボールスーパーカードゲーム フュージョンワールド各種を再販実施中のストア"
+        self.assertFalse(cs._is_actionable_line(line))
+
+    def test_section_headings_rejected(self):
+        self.assertFalse(cs._is_actionable_line(
+            "ドラゴンボールスーパーカードゲーム フュージョンワールド各種の先着販売を行っているストア"))
+        self.assertFalse(cs._is_actionable_line(
+            "ドラゴンボールスーパーカードゲーム フュージョンワールド各種の抽選販売を行っているストア"))
+
+    def test_prose_and_promo_rejected(self):
+        self.assertFalse(cs._is_actionable_line(
+            "を実施しており、直近もこれらのストアでは定期的に入荷・再販が確認できています。"))
+        self.assertFalse(cs._is_actionable_line(
+            "では販売・再販開始と同時にプッシュ通知で入荷通知を配信中"))
+        self.assertFalse(cs._is_actionable_line("人気商品の入荷速報専用アプリ『入荷Now』"))
+
+    def test_concrete_store_row_still_notified(self):
+        # 具体的な店舗×商品×行動の行は引き続き通知される（過剰除外していない）
+        self.assertTrue(cs._is_actionable_line(
+            "楽天ブックスにてフュージョンワールド CROSS FORCE BOXが再販開始"))
