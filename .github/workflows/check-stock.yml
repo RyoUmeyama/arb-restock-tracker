@@ -34,7 +34,9 @@ on:
         default: '0'
 
 concurrency:
-  group: gunpla-restock
+  # debug_discovery実行はcronと別グループにする（同一グループだとpendingは1本までの
+  # 仕様により、後続cronに押し出されてキャンセルされ、検証がいつまでも走れない）
+  group: ${{ github.event.inputs.debug_discovery == '1' && 'gunpla-restock-debug' || 'gunpla-restock' }}
   cancel-in-progress: false
 
 permissions:
