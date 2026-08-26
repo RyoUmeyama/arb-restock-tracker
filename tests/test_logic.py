@@ -1207,3 +1207,68 @@ class TestPokecenArticleStructure(unittest.TestCase):
         self.assertNotIn("\n  https://www.pokemoncenter-online.com/", body,
                          "記事URLの直下に監視元URLを重ねない")
         self.assertNotIn('<a href="https://www.pokemoncenter-online.com/"', html)
+
+
+class TestHistoryLogPrecision(unittest.TestCase):
+    """nyuka-now履歴ログの事後通知を抑制する（2026-08-26 実害の回帰）。
+
+    履歴行の新規出現は「再販が起きた（もう売り切れている）」の事後報告。
+    アニメイトFB10再販を検索URLつきで通知したが購入不可だった。
+    """
+
+    ITEM = {"name": "DBFW 在庫・再販集約（横断）", "method": "page_update",
+            "url": "https://nyuka-now.com/archives/140408", "retail_price": 5280,
+            "key": "t_nyuka"}
+    EVENT_LINE = "アニメイトにて フュージョンワールド CROSS FORCE BOX【再販】が販売開始"
+    OPEN_LINE = "ヨドバシにて CROSS FORCE BOX の抽選受付開始 8月30日まで"
+
+    def _run(self, lines, resolved_link=None, store_page=""):
+        orig_sig, orig_sleep = cs.compute_page_signature, cs.time.sleep
+        orig_resolve, orig_http = cs.resolve_store_link, cs.http_get
+        cs.compute_page_signature = lambda item: ("new", lines, True, "<html>")
+        cs.time.sleep = lambda s: None
+        cs.resolve_store_link = lambda html, l, anchors: resolved_link
+
+        class R:
+            content = store_page.encode()
+        cs.http_get = lambda url, **kw: R()
+        try:
+            prev = {"t_nyuka": {"sig": "old", "lines": [], "links": {}}}
+            ns, alerts, h = {}, [], {"ok": [], "fail": [], "suppressed": 0}
+            cs._process_item(self.ITEM, prev, ns, alerts, h)
+            return alerts, h
+        finally:
+            cs.compute_page_signature = orig_sig
+            cs.time.sleep = orig_sleep
+            cs.resolve_store_link = orig_resolve
+            cs.http_get = orig_http
+
+    def test_event_line_without_link_suppressed(self):
+        # 確認先が検索URLしかない履歴行は通知しない
+        alerts, h = self._run([self.EVENT_LINE], resolved_link=None)
+        self.assertEqual(alerts, [])
+        self.assertEqual(h["suppressed"], 1)
+
+    def test_event_line_with_soldout_page_suppressed(self):
+        alerts, h = self._run([self.EVENT_LINE],
+                              resolved_link="https://www.animate-onlineshop.jp/pd/1",
+                              store_page="<html>ただいま品切れ中です</html>")
+        self.assertEqual(alerts, [])
+
+    def test_event_line_with_live_page_notified(self):
+        alerts, h = self._run([self.EVENT_LINE],
+                              resolved_link="https://www.animate-onlineshop.jp/pd/1",
+                              store_page="<html>カートに入れる</html>")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("アニメイト", alerts[0][1])
+
+    def test_open_action_line_notified_without_verification(self):
+        # 抽選・予約は締切まで猶予があるため在庫確認なしで通知する
+        alerts, h = self._run([self.OPEN_LINE], resolved_link=None)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("抽選受付", alerts[0][1])
+
+    def test_non_history_page_unaffected(self):
+        # anime-matsuri等の非ログページは従来どおり（既存TestProcessItemPageUpdateも担保）
+        self.assertFalse(cs._is_history_log_page({"url": "https://anime-matsuri.com/x/"}))
+        self.assertTrue(cs._is_history_log_page(self.ITEM))

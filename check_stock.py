@@ -1240,6 +1240,46 @@ def report_release_calendar(prev, new_state, alerts, now_jst):
         print(f"  ⚠ 発売カレンダーの算出でエラー（スキップ）: {e}")
 
 
+# 「これから行動できる」ことを示す語。履歴ログページ（nyuka-now集約）では、
+# この語を含む行だけは在庫確認なしで通知してよい（締切までの猶予があるため）
+OPEN_ACTION_KEYWORDS = ["抽選", "予約", "受付", "応募", "招待"]
+
+# 通知直前の簡易在庫確認で「完売」とみなすリンク先の表示
+SOLDOUT_MARKERS = ["売り切れ", "在庫切れ", "品切れ", "sold out", "soldout",
+                   "販売終了", "取り扱いを終了", "入荷待ち", "再入荷待ち", "完売"]
+
+
+def contains_any(text, keywords):
+    lower = text.lower()
+    return any(k.lower() in lower for k in keywords)
+
+
+def _is_history_log_page(item):
+    """過去の販売・再販履歴を時系列に並べるログ型ページか（nyuka-now集約）。
+
+    ログ型ページの新規行は「再販が起きた」という事後報告で、TCGの再販は分単位で
+    完売するため、検知時点でほぼ買えない（2026-08-26 実害）。
+    """
+    return "nyuka-now" in (item.get("url") or "")
+
+
+def _quick_stock_check(url):
+    """通知直前の簡易在庫確認。品切れ表示が見えたらFalse、判定できなければNone。
+
+    汎用の文字列判定のみ（店舗別のパーサは持たない方針）。断定できるのは
+    「品切れ表示がある＝完売」の方向だけで、在庫ありの断定はしない。
+    """
+    try:
+        body = http_get(url, allow_redirects=True).content.decode("utf-8", errors="replace")
+        time.sleep(config.REQUEST_INTERVAL)
+    except Exception as e:
+        print(f"    ⚠ 在庫確認の取得失敗（未確認のまま通知）: {e}")
+        return None
+    if contains_any(body, SOLDOUT_MARKERS):
+        return False
+    return None
+
+
 # ポケセン記事の定型挨拶文（全記事共通で情報ゼロ。snippetの文字数枠を食い潰すので落とす）
 POKECEN_BOILERPLATE_PREFIXES = (
     "平素より", "ご不便をおかけ", "ご理解のほど", "お買い物にあたり",
@@ -1517,6 +1557,31 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
                         c["source_url"] = links.get(l) or item.get("url", "")
                         c["detected_at"] = today_jst.isoformat()
                         candidates.append(c)
+            # nyuka-now集約ページは「過去の販売・再販履歴のログ」で、履歴行は検知時点で
+            # ほぼ完売している（2026-08-26 実害: アニメイトFB10再販を通知→購入不可）。
+            # 履歴行（開始済みイベント）は直リンク先に品切れ表示がないことを確認できた
+            # 場合だけ通知し、確認手段がない（検索URLしかない）行は通知しない。
+            # 抽選・予約・受付など「これから行動できる」行は従来どおり通知する。
+            if _is_history_log_page(item):
+                passed = []
+                for l in actionable:
+                    if contains_any(l, OPEN_ACTION_KEYWORDS):
+                        passed.append(l)
+                        continue
+                    link = links.get(l)
+                    if not link:
+                        print(f"    抑制（事後ログ・確認先なし）: {l[:50]}")
+                        continue
+                    if _quick_stock_check(link) is False:
+                        print(f"    抑制（リンク先が品切れ表示）: {l[:50]}")
+                        continue
+                    passed.append(l)
+                if len(passed) < len(actionable):
+                    health["suppressed"] = health.get("suppressed", 0) + (len(actionable) - len(passed))
+                actionable = passed
+                if not actionable:
+                    print(f"  {item['name']}: 更新あり（完売済み履歴のみ・通知抑制）")
+                    return
             # 1告知=「■見出し行＋URL行」のブロック。全告知を「 ／ 」で1行に繋ぐと
             # メールが読めない壁になる（2026-08-21 実害）。改行はbuild_messagesが
             # HTMLでは<br>に変換する
