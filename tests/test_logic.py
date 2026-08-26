@@ -1272,3 +1272,33 @@ class TestHistoryLogPrecision(unittest.TestCase):
         # anime-matsuri等の非ログページは従来どおり（既存TestProcessItemPageUpdateも担保）
         self.assertFalse(cs._is_history_log_page({"url": "https://anime-matsuri.com/x/"}))
         self.assertTrue(cs._is_history_log_page(self.ITEM))
+
+
+class TestFailStreakClassification(unittest.TestCase):
+    """ヘルスレポートの障害分類（2026-08-26 実害の回帰）。
+
+    c-labo.jpの断続タイムアウトを1パスのスナップショットで「⚠要確認」と
+    断定して過剰警告していた。連続失敗パス数で恒常/一時を区別する。
+    """
+
+    def test_streak_increments_and_resets(self):
+        ns1 = {}
+        cs._update_fail_streaks({}, ns1, {"ok": [], "fail": [("A", "u"), ("B", "u")], "suppressed": 0})
+        self.assertEqual(ns1["fail_streaks"], {"A": 1, "B": 1})
+        ns2 = {}
+        cs._update_fail_streaks(ns1, ns2, {"ok": ["B"], "fail": [("A", "u")], "suppressed": 0})
+        self.assertEqual(ns2["fail_streaks"], {"A": 2}, "成功したら連続失敗はリセット")
+
+    def test_classification_by_threshold(self):
+        import config
+        streaks = {"死んでる監視": config.PERSISTENT_FAIL_PASSES, "たまに失敗": 1}
+        persistent, transient = cs._classify_unexpected_fails(
+            ["死んでる監視", "たまに失敗"], streaks)
+        self.assertEqual(persistent, ["死んでる監視"])
+        self.assertEqual(transient, ["たまに失敗"])
+
+    def test_unknown_item_is_transient(self):
+        # streak記録がない（初回失敗）は一時失敗として扱う
+        persistent, transient = cs._classify_unexpected_fails(["新顔"], {})
+        self.assertEqual(persistent, [])
+        self.assertEqual(transient, ["新顔"])

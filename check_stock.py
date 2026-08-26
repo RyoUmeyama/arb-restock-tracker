@@ -989,6 +989,31 @@ HEARTBEAT_CARRY_KEYS = ("last_heartbeat", "digest_seen", "suggested_seen",
                         "am_pages_seen", "auto_watch", "am_discovery_fail_streak")
 
 
+def _update_fail_streaks(prev, new_state, health):
+    """監視項目ごとの連続取得失敗パス数を更新する。
+
+    ヘルスレポートが1パスのスナップショットで「要確認」と断定すると、
+    断続的なタイムアウト（c-labo.jp等）でも障害扱いになり過剰警告になる
+    （2026-08-26 実害）。連続失敗数で恒常障害と一時失敗を区別する。
+    """
+    streaks = dict(prev.get("fail_streaks") or {})
+    for name, _url in health["fail"]:
+        streaks[name] = streaks.get(name, 0) + 1
+    for name in health["ok"]:
+        streaks.pop(name, None)
+    new_state["fail_streaks"] = streaks
+    return streaks
+
+
+def _classify_unexpected_fails(unexpected, streaks):
+    """想定外の取得不能を（恒常障害, 一時失敗）に分ける。"""
+    persistent = [n for n in unexpected
+                  if streaks.get(n, 0) >= config.PERSISTENT_FAIL_PASSES]
+    transient = [n for n in unexpected
+                 if streaks.get(n, 0) < config.PERSISTENT_FAIL_PASSES]
+    return persistent, transient
+
+
 def _track_discovery_failure(prev, new_state, alerts):
     """まとめページ自動発見の連続失敗を数え、3日連続でメール警告する。
 
@@ -1042,7 +1067,17 @@ def append_heartbeat(prev, new_state, alerts, health):
             parts.append(f"nyuka-nowクラウド遮断{exp_nyuka}件")
         lines.append(f"想定内の取得不能{len(expected)}件（" + "・".join(parts) + "）")
     if unexpected:
-        lines.append(f"⚠要確認の取得不能{len(unexpected)}件: " + "、".join(unexpected[:6]))
+        # 連続失敗パス数で恒常障害（要確認）と断続的な失敗（自動回復中）を区別する。
+        # fail_streaks はこのパスの分まで run_once 側で更新済み
+        streaks = new_state.get("fail_streaks") or prev.get("fail_streaks") or {}
+        persistent, transient = _classify_unexpected_fails(unexpected, streaks)
+        if persistent:
+            lines.append(f"⚠要確認の取得不能{len(persistent)}件"
+                         f"（{config.PERSISTENT_FAIL_PASSES}パス以上連続失敗・恒常障害の疑い）: "
+                         + "、".join(persistent[:6]))
+        if transient:
+            lines.append(f"一時的な取得失敗{len(transient)}件（断続・自動回復中）: "
+                         + "、".join(transient[:6]))
     # 週次運用サマリ（月曜のみ）: 通知フィルタが絞りすぎていないかを数字で確認できるようにする
     stats = new_state.get("weekly_stats") or {}
     if now_jst.weekday() == 0 and stats:
@@ -1119,7 +1154,8 @@ def append_heartbeat(prev, new_state, alerts, health):
                 print(f"  🔎 新しい抽選まとめページ {len(fresh_pages)}件を提案")
                 alerts.append((am_item,
                                "\n" + "\n".join("・" + l for l in pg_lines) +
-                               "\n（監視に追加したい場合はClaude Codeに伝えてください）", "info"))
+                               "\n（※発見したページは自動で監視に追加済み。"
+                               "外したいものがあればClaude Codeに伝えてください）", "info"))
             else:
                 print("  🔎 新しい抽選まとめページなし")
     except Exception as e:
@@ -1731,6 +1767,8 @@ def run_once():
                 health["ok"].remove(item["name"])
             health["fail"].append((item["name"], item.get("url", "")))
             print(f"  ⚠ {item['name']}: 想定外エラーで判定不能（前回状態を維持）: {e}")
+
+    _update_fail_streaks(prev, new_state, health)
 
     save_lottery_candidates(candidates)
 
