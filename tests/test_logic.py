@@ -1322,3 +1322,26 @@ class TestTournamentEventExcluded(unittest.TestCase):
     def test_product_lottery_still_notified(self):
         self.assertTrue(cs._is_actionable_line(
             "「ポケモンカードゲーム MEGA 30th CELEBRATION」BOX 抽選販売のお知らせ"))
+
+
+class TestNoiseSweep20260831(unittest.TestCase):
+    """一斉監査（2026-08-31）: まとめページの広告・公式の大会運営告知を通知しない。"""
+
+    def test_oripa_ads_rejected(self):
+        # anime-matsuriページ埋め込みのオリパ・ポイ活広告（行動語を含み素通りしていた）
+        self.assertFalse(cs._is_actionable_line(
+            "ライン公式友達追加で時間限定還元率100％超えオリパ＆最大35％お得にPT購入"))
+        self.assertFalse(cs._is_actionable_line("初回限定5,000PT購入で最大12,350PTボーナス増量"))
+        self.assertFalse(cs._is_actionable_line("プロモーション【広告】を含みます。"))
+
+    def test_official_event_ops_rejected(self):
+        self.assertFalse(cs._is_actionable_line("「チャンピオンズリーグ2026 愛知 May」の招待選手が決定！"))
+        self.assertFalse(cs._is_actionable_line("ゲスト参加決定！追加先着応募開始！"))
+        self.assertFalse(cs._is_actionable_line("追加先着エントリーの受付開始"))
+        self.assertFalse(cs._is_actionable_line("ポケカジムエントリーキャンペーン2026年後期、9月1日スタート！"))
+
+    def test_product_release_still_notified(self):
+        self.assertTrue(cs._is_actionable_line(
+            "「30th CELEBRATION プレミアムデッキセット エーフィ・ブラッキー」が、9月16日（水）に発売！"))
+        self.assertTrue(cs._is_actionable_line(
+            "【第二回】ポケモンセンターオンラインでの30周年商品の抽選受け付けについて (外部リンク)"))
