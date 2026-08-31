@@ -17,7 +17,7 @@ import sys
 import json
 import time
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -986,7 +986,20 @@ def extract_opportunities(prev, new_state, today):
 
 # append_heartbeat が非発火パスでも prev から引き継ぐ状態キー
 HEARTBEAT_CARRY_KEYS = ("last_heartbeat", "digest_seen", "suggested_seen",
-                        "am_pages_seen", "auto_watch", "am_discovery_fail_streak")
+                        "am_pages_seen", "auto_watch", "am_discovery_fail_streak",
+                        "suppressed_log")
+
+
+def _log_suppression(prev, new_state, item_name, line, reason):
+    """フィルタが通知を抑制した行をstateに記録する（毎朝のヘルスレポートで開示）。
+
+    「送信前に精度を確認しつつ、送り忘れも逃さない」ための仕組み（2026-08-31）。
+    抑制を黙って捨てると、フィルタの誤りで本物の機会を失っても気づけない。
+    """
+    log = list(new_state.get("suppressed_log") or prev.get("suppressed_log") or [])
+    log.append({"t": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(),
+                "item": item_name, "line": line[:80], "reason": reason})
+    new_state["suppressed_log"] = log[-config.SUPPRESS_LOG_KEEP:]
 
 
 def _update_fail_streaks(prev, new_state, health):
@@ -1043,7 +1056,8 @@ def append_heartbeat(prev, new_state, alerts, health):
     # 非発火パスでも維持する状態キー。auto_watch を含め忘れると、ヘルスレポート以外の
     # パスで保存のたびに動的監視リストが消える（2026-08-25 発見の潜在バグ）
     for carry_key in HEARTBEAT_CARRY_KEYS:
-        new_state[carry_key] = prev.get(carry_key)
+        # パスの処理中に既に書き込まれたキー（suppressed_log等）を上書きしない
+        new_state.setdefault(carry_key, prev.get(carry_key))
     if now_jst.hour < 9 or prev.get("last_heartbeat") == today:
         return
     new_state["last_heartbeat"] = today
@@ -1085,6 +1099,17 @@ def append_heartbeat(prev, new_state, alerts, health):
                      f"通知{stats.get('notified', 0)}件・ノイズ抑制{stats.get('suppressed', 0)}件・"
                      f"新チャンス{stats.get('chances', 0)}件")
         new_state["weekly_stats"] = {"notified": 0, "suppressed": 0, "chances": 0, "since": today}
+    # 直近24hにフィルタが抑制した通知を開示する（「送り忘れを逃さない」ための監査窓。
+    # 本物の機会が誤って落とされていればここで気づける。2026-08-31）
+    sup_log = new_state.get("suppressed_log") or prev.get("suppressed_log") or []
+    cutoff = (now_jst - timedelta(days=1)).isoformat()
+    recent_sup = [e for e in sup_log if e.get("t", "") >= cutoff]
+    if recent_sup:
+        lines.append(f"🧹 直近24hのフィルタ抑制{len(recent_sup)}件（誤って落ちていないか確認用）:")
+        for e in recent_sup[:8]:
+            lines.append(f"　- [{e.get('item', '?')[:20]}] {e.get('line', '')[:60]}（{e.get('reason', '')}）")
+        if len(recent_sup) > 8:
+            lines.append(f"　…ほか{len(recent_sup) - 8}件")
     lines.append("このレポートが毎朝届いていればBotは正常稼働しています。")
     hb_item = {
         "name": "📊 日次ヘルスレポート（Bot生存確認）",
@@ -1445,6 +1470,8 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
                 continue
             title, text = _pokecen_article_summary(body)
             if require and not any(k in f"{title or ''} {text}" for k in require):
+                _log_suppression(prev, new_state, item["name"],
+                                 title or f"記事{nid}", "対象キーワードなし")
                 continue
             date_str = (f"{nid[:4]}/{nid[4:6]}/{nid[6:8]}"
                         if len(nid) == 8 and nid.isdigit() else nid)
@@ -1581,6 +1608,8 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
             # 「実質的な情報の行」だけに絞る。定型文の変化や行の削除だけの更新は
             # 通知しない（=通知が来たら本物、の精度を守る）。
             actionable = [l for l in added if _notable(l)]
+            for l in [x for x in added if x not in set(actionable)][:5]:
+                _log_suppression(prev, new_state, item["name"], l, "実質情報フィルタ")
             if not actionable:
                 health["suppressed"] = health.get("suppressed", 0) + 1
                 print(f"  {item['name']}: 更新あり（実質情報なし・通知抑制。新規{len(added)}行）")
@@ -1607,9 +1636,11 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
                     link = links.get(l)
                     if not link:
                         print(f"    抑制（事後ログ・確認先なし）: {l[:50]}")
+                        _log_suppression(prev, new_state, item["name"], l, "事後ログ・確認先なし")
                         continue
                     if _quick_stock_check(link) is False:
                         print(f"    抑制（リンク先が品切れ表示）: {l[:50]}")
+                        _log_suppression(prev, new_state, item["name"], l, "リンク先が品切れ表示")
                         continue
                     passed.append(l)
                 if len(passed) < len(actionable):

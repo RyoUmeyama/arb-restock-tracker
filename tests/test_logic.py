@@ -1345,3 +1345,61 @@ class TestNoiseSweep20260831(unittest.TestCase):
             "「30th CELEBRATION プレミアムデッキセット エーフィ・ブラッキー」が、9月16日（水）に発売！"))
         self.assertTrue(cs._is_actionable_line(
             "【第二回】ポケモンセンターオンラインでの30周年商品の抽選受け付けについて (外部リンク)"))
+
+
+class TestSuppressionAudit(unittest.TestCase):
+    """フィルタ抑制の記録と開示（2026-08-31「精度確認と送り忘れ防止の両立」）。"""
+
+    def test_log_appends_and_caps(self):
+        import config
+        prev, ns = {}, {}
+        for i in range(config.SUPPRESS_LOG_KEEP + 10):
+            cs._log_suppression(prev, ns, "監視A", f"行{i}", "テスト")
+            prev = {}  # new_state側に蓄積される
+        self.assertEqual(len(ns["suppressed_log"]), config.SUPPRESS_LOG_KEEP)
+        self.assertEqual(ns["suppressed_log"][-1]["line"], f"行{config.SUPPRESS_LOG_KEEP + 9}")
+
+    def test_carry_does_not_clobber_pass_writes(self):
+        # パス中に書いた suppressed_log を append_heartbeat のcarryが上書きしない
+        from datetime import datetime as _dt
+        import datetime as _dtmod
+        class FakeDT(_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 31, 3, 0, tzinfo=tz)  # JST 3時=非発火で早期return
+        orig = cs.datetime
+        cs.datetime = FakeDT
+        try:
+            prev = {"suppressed_log": [{"t": "old", "item": "x", "line": "旧", "reason": "r"}]}
+            ns, alerts = {}, []
+            cs._log_suppression(prev, ns, "監視A", "新しい抑制", "テスト")
+            cs.append_heartbeat(prev, ns, alerts, {"ok": [], "fail": [], "suppressed": 0})
+            lines = [e["line"] for e in ns["suppressed_log"]]
+            self.assertIn("新しい抑制", lines, "carryで上書きされてはいけない")
+        finally:
+            cs.datetime = orig
+
+    def test_heartbeat_discloses_recent_suppressions(self):
+        from datetime import datetime as _dt, timedelta as _td
+        from zoneinfo import ZoneInfo as _zi
+        class FakeDT(_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 9, 2, 10, 0, tzinfo=tz)  # 火曜10時（週次サマリなし）
+        orig = cs.datetime
+        cs.datetime = FakeDT
+        try:
+            recent_t = "2026-09-02T08:00:00+09:00"
+            old_t = "2026-08-25T08:00:00+09:00"
+            prev = {"suppressed_log": [
+                {"t": recent_t, "item": "DBFW 集約", "line": "抑制された行", "reason": "品切れ表示"},
+                {"t": old_t, "item": "古い監視", "line": "古い抑制", "reason": "r"},
+            ]}
+            ns, alerts = {}, []
+            cs.append_heartbeat(prev, ns, alerts, {"ok": ["a"], "fail": [], "suppressed": 0})
+            hb = [a for a in alerts if "ヘルス" in a[0]["name"]][0]
+            self.assertIn("フィルタ抑制1件", hb[1])
+            self.assertIn("抑制された行", hb[1])
+            self.assertNotIn("古い抑制", hb[1], "24hより古い抑制は載せない")
+        finally:
+            cs.datetime = orig
