@@ -1302,3 +1302,23 @@ class TestFailStreakClassification(unittest.TestCase):
         persistent, transient = cs._classify_unexpected_fails(["新顔"], {})
         self.assertEqual(persistent, [])
         self.assertEqual(transient, ["新顔"])
+
+
+class TestTournamentEventExcluded(unittest.TestCase):
+    """公認大会・イベントの参加抽選を通知しない（2026-08-31 実害の回帰）。
+
+    「シティリーグ2027 シーズン1」事前抽選のエントリー期間延長が「抽選」語で
+    通過して通知された。大会参加は商品入手と無関係。
+    """
+
+    def test_city_league_rejected(self):
+        self.assertFalse(cs._is_actionable_line(
+            "「シティリーグ2027 シーズン1」事前抽選のエントリー期間延長のお知らせ"))
+
+    def test_champions_league_rejected(self):
+        self.assertFalse(cs._is_actionable_line(
+            "チャンピオンズリーグ2027 東京 事前抽選エントリー受付開始"))
+
+    def test_product_lottery_still_notified(self):
+        self.assertTrue(cs._is_actionable_line(
+            "「ポケモンカードゲーム MEGA 30th CELEBRATION」BOX 抽選販売のお知らせ"))
