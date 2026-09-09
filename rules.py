@@ -25,6 +25,44 @@ def _normalize_box_name(s):
     return s
 
 
+# 監視名の接尾辞（監視元の種別）。生の名前・正規化後の両方の形を持つ
+_WATCH_NAME_SUFFIXES = (
+    " 抽選/再販まとめ（anime-matsuri）", " 抽選/予約まとめ（anime-matsuri）",
+    " 再販告知まとめ（anime-matsuri）", " 再販集約", "（横断）", "（在庫）",
+    "（楽天ブックス）", "（東映ストア）",
+    "抽選/再販まとめanime-matsuri", "抽選/予約まとめanime-matsuri", "再販告知まとめanime-matsuri",
+    "再販集約", "横断", "在庫", "楽天ブックス", "東映ストア",
+)
+# 公式商品名のカテゴリ接頭辞（長い順に並べること。前方一致で1つだけ剥がす）
+_CATEGORY_PREFIXES = (
+    "拡張パックデラックス", "強化拡張パック", "拡張パック", "ハイクラスパック",
+    "スペシャルカードセット", "スペシャルBOX", "スペシャルセット",
+    "プレミアムトレーナーボックス", "デッキビルド", "スターターセット", "構築デッキ",
+    "MEGA", "メガ",
+)
+
+
+def _core_product_name(s):
+    """監視名／公式商品名を「商品コア名」に揃える（発売カレンダーの監視済み照合用）。
+    生の名前でも _normalize_box_name 済みの名前でも同じ結果になる。
+    例: "ポケカ 30th CELEBRATION 抽選/予約まとめ（anime-matsuri）" → "30thCELEBRATION"
+        "拡張パック「30th CELEBRATION」" → "30thCELEBRATION"
+        "ハイクラスパック「MEGAドリームex」" / "ポケカ MEGAドリームex 抽選/…" → "ドリームex" """
+    s = s or ""
+    for w in _WATCH_NAME_SUFFIXES:
+        s = s.replace(w, "")
+    s = _normalize_box_name(s)
+    for w in ("ポケカ", "ポケモンカード", "ポケモンカードゲーム"):
+        if s.startswith(w):
+            s = s[len(w):]
+    for _ in range(3):  # 「MEGA拡張パック…」のように接頭辞が重なる場合があるため数回剥がす
+        hit = next((pre for pre in _CATEGORY_PREFIXES if s.startswith(pre)), None)
+        if not hit:
+            break
+        s = s[len(hit):]
+    return s
+
+
 def match_altema_price(name, prices):
     """altema相場辞書から監視名 name に対応する買取価格を選ぶ。
     正規化後、(1)完全一致を最優先。(2)無ければ『監視名コアが altema銘柄名に含まれる』
@@ -123,10 +161,17 @@ def upcoming_releases(products, today, watched_names, min_price, window_days):
         if not is_pack:
             if price is None or price < min_price:
                 continue
-        nk = _normalize_box_name(title)
+        nk = _core_product_name(title)
         if not nk:
             continue
-        if any(w and (w in nk or nk in w) for w in watched_names):
+        # 監視名は呼び出し側で _normalize_box_name 済み（"30thCELEBRATION抽選/予約まとめanime-matsuri"）
+        # なので、ここで双方をコア名（カテゴリ接頭辞・監視元の接尾辞を剥がした形）に揃えて照合する
+        # （2026-09-09 監査: 以前は生の正規化名同士で「w in nk or nk in w」を見ており本番では
+        # 一度も一致せず、監視済み銘柄が発売カレンダーに毎回載っていた）。
+        # 方向は「商品コア ⊆ 監視コア」のみ。逆（監視 "30thCELEBRATION" ⊂ 商品
+        # "30thCELEBRATIONFUTURISTIC"）まで除外すると、別商品のFUTURISTIC BOX等が消える
+        cores = [_core_product_name(w) for w in watched_names if w]
+        if any(len(w) >= 3 and nk in w for w in cores):
             continue
         out.append((rd, title, price or 0, p.get("link") or ""))
     out.sort(key=lambda x: (x[0], -x[2]))
@@ -167,12 +212,23 @@ def passes_profit(retail, market, is_pokeca):
     return "unknown"  # 中間帯は監視継続（安全側）
 
 
+def _is_supply_noise(line):
+    """サプライ語を「商品そのもの」として含むか。「ラバーマット付き プレミアムデッキセット」の
+    ように本体の付属品として現れる（直後が 付/つき/同梱）場合はサプライ扱いしない
+    （2026-09-09 監査: 30thのラバーマット付きデッキセットの抽選が落ちていた）。"""
+    for kw in config.SUPPLY_NOISE_KEYWORDS:
+        for m in re.finditer(re.escape(kw), line):
+            if not re.match(r"(付|つき|同梱)", line[m.end(): m.end() + 2]):
+                return True
+    return False
+
+
 def _deck_supply_rule(line, is_pokeca, today):
     """商品ライフサイクル規則（サプライ/デッキ系）を適用する。
     返り値: (excluded, forced)。excluded=True なら通知対象外。
     forced=True はポケカのデッキ系初回販売（明示的に通知対象）。
     差分通知と朝のダイジェストの両方で共通に使う。"""
-    if any(kw in line for kw in config.SUPPLY_NOISE_KEYWORDS):
+    if _is_supply_noise(line):
         return True, False
     # スターターセット/構築デッキ系（「スタートデッキ」は別扱いで常に許可）
     if any(kw in line for kw in config.DECK_PRODUCT_KEYWORDS) and "スタートデッキ" not in line:
@@ -181,6 +237,13 @@ def _deck_supply_rule(line, is_pokeca, today):
         if any(w in line for w in ("再販", "再入荷", "再販売")):
             return True, False  # ポケカのデッキ系は初回販売のみ（再販は転売不可）
         dates = _upcoming_dates(line, today) if today else []
+        if not dates:
+            # 日付のない行は「予約/抽選/受付開始」の告知に限り初回販売期とみなす
+            # （2026-09-09 監査: 公式infoの「デッキビルドBOX 予約受付開始」が日付なしで落ちていた。
+            # 「好評発売中」のような継続状態の行は従来どおり通知しない）
+            if any(w in line for w in ("予約", "抽選", "受付開始")):
+                return False, True
+            return True, False
         if not any(abs((d - today).days) <= config.INITIAL_SALE_WINDOW_DAYS for d in dates):
             return True, False  # 発売前後の初回販売期でなければ通知しない
         return False, True
@@ -211,6 +274,9 @@ def _is_actionable_line(line, today=None, strict=False, is_pokeca=False):
         再販は通知しない。ポケカ以外は通知しない
       - スタートデッキ: 再販でも人気のため常に通知対象（例外）"""
     if not (config.DIGEST_LINE_MINLEN <= len(line) <= 120):
+        return False
+    # サイドバーのカテゴリ件数「抽選販売・予約 (46)」はナビ断片（2026-09-09 監査）
+    if re.match(r"^[^\d]{2,20}\s*[（(]\d+[)）]$", line.strip()):
         return False
     if any(mk in line for mk in config.DIGEST_EXCLUDE_MARKERS):
         return False
@@ -313,6 +379,10 @@ def _upcoming_dates(text, today):
             continue
         if (today - dt).days > 180:
             dt = date(today.year + 1, int(m), int(d))
+        elif (dt - today).days > 180:
+            # 逆方向の年跨ぎ: 1月に見た「12月26日に発売」は昨年（2026-09-09 監査で追加。
+            # 以前は11ヶ月先の未来と解釈され、古い発売告知が「近い将来」扱いになり得た）
+            dt = date(today.year - 1, int(m), int(d))
         found.append(dt)
     for y, m, d in re.findall(r"(202\d)[/.](\d{1,2})[/.](\d{1,2})", text):
         try:
@@ -321,12 +391,109 @@ def _upcoming_dates(text, today):
             continue
     return found
 
+_DATE_SPAN_RE = re.compile(
+    r"(?:(20\d\d)\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*日"
+    r"|(202\d)[/.](\d{1,2})[/.](\d{1,2})")
+_RANGE_SEP_RE = re.compile(r"^\s*(?:[（(][^)）]{1,4}[)）])?\s*[〜~～\-－ー]\s*")
+# 日付の直前の文脈で「応募期間ではない日付」を示す語（発売日・当選発表・注文期限・お届け）
+_NOT_APPLY_LABELS = ("発売", "当選", "発表", "注文", "お届け", "出荷", "配送")
+# 「応募期間」を示す語
+_APPLY_LABELS = ("応募", "受付", "申込", "抽選期間", "エントリー", "抽選")
+
+
+def _date_spans(text, today):
+    """テキスト中の日付を (開始位置, 終了位置, date) で返す。年なしは _upcoming_dates と同じ
+    年跨ぎ規則で解決する。"""
+    from datetime import date
+    out = []
+    for m in _DATE_SPAN_RE.finditer(text):
+        try:
+            if m.group(2):
+                y, mo, d = m.group(1), int(m.group(2)), int(m.group(3))
+                if y:
+                    dt = date(int(y), mo, d)
+                else:
+                    dt = date(today.year, mo, d)
+                    if (today - dt).days > 180:
+                        dt = date(today.year + 1, mo, d)
+                    elif (dt - today).days > 180:
+                        dt = date(today.year - 1, mo, d)
+            else:
+                dt = date(int(m.group(4)), int(m.group(5)), int(m.group(6)))
+        except ValueError:
+            continue
+        out.append((m.start(), m.end(), dt))
+    return out
+
+
+def _nearest_label(ctx):
+    """直前文脈（約30字）で日付に最も近いラベル語を返す: 'apply' / 'not_apply' / None。
+    「当選発表 9月12日 応募受付 9月1日〜」のように複数ラベルがある場合は近い方が勝つ。"""
+    best = (-1, None)
+    for w in _NOT_APPLY_LABELS:
+        p = ctx.rfind(w)
+        if p > best[0]:
+            best = (p, "not_apply")
+    for w in _APPLY_LABELS:
+        p = ctx.rfind(w)
+        if p > best[0]:
+            best = (p, "apply")
+    return best[1]
+
+
+def _apply_period(line, today, window_days=60):
+    """行から応募期間 (apply_start, apply_end) を推定する。どちらも date | None。
+    2026-09-09 監査: 以前は「行内の最大日付=締切」だったため、発売日・当選発表日・注文期限が
+    締切として台帳に登録されていた。方針:
+      - 「A〜B」の範囲で直前文脈が 応募/受付/申込/抽選期間/エントリー → 最優先で採用
+      - 単独日付は直前約30字のラベルが 発売/当選/発表/注文/お届け/出荷/配送 なら除外。
+        直後が「発売」（「9月16日発売」）の単独日付も除外
+      - 残った日付が無ければ (None, None)（発売日しか無い行は締切が分からない＝登録しない）"""
+    spans = _date_spans(line, today)
+    if not spans:
+        return None, None
+
+    def in_window(d):
+        return 0 <= (d - today).days <= window_days
+
+    ranges, used = [], set()
+    for i in range(len(spans) - 1):
+        s1, e1, d1 = spans[i]
+        s2, e2, d2 = spans[i + 1]
+        if _RANGE_SEP_RE.match(line[e1:s2]) and d1 <= d2:
+            ranges.append((s1, d1, d2))
+            used.update((i, i + 1))
+    apply_ranges, neutral_ranges = [], []
+    for s1, d1, d2 in ranges:
+        label = _nearest_label(line[max(0, s1 - 30): s1])
+        if label == "not_apply":
+            continue
+        (apply_ranges if label == "apply" else neutral_ranges).append((d1, d2))
+    for d1, d2 in apply_ranges + neutral_ranges:
+        if in_window(d2):
+            return (d1 if in_window(d1) else None), d2
+    singles = []
+    for i, (s, e, d) in enumerate(spans):
+        if i in used:
+            continue
+        if _nearest_label(line[max(0, s - 30): s]) == "not_apply":
+            continue
+        if re.match(r"(?:[（(][^)）]{1,4}[)）])?\s*(?:に|より|から|頃)?\s*発売", line[e: e + 10]):
+            continue
+        if in_window(d):
+            singles.append(d)
+    if not singles:
+        return None, None
+    return (min(singles) if len(singles) > 1 else None), max(singles)
+
+
 def extract_lottery_candidate(line, item, today, store_hints):
     """検知行から「応募台帳に登録できる構造化された抽選候補」を抽出する。
     条件（すべて必須・精度優先）:
       - 行に店舗名（store_hints のキー）がある
       - 抽選/応募/予約/先着 のいずれかを含む
-      - 今日以降の日付が1つ以上ある（締切=最も遅い日付、開始=最も早い日付）
+      - 応募期間の締切と解釈できる今日以降の日付がある（_apply_period。発売日・当選発表日・
+        注文期限は締切に採らない。2026-09-09 監査）
     返り値: dict（channel/product/apply_start/apply_end） | None。
     商品名は監視アイテム名から取る（行の断片より確実）。"""
     channel = next((name for name in store_hints if name in line), None)
@@ -334,13 +501,13 @@ def extract_lottery_candidate(line, item, today, store_hints):
         return None
     if not any(kw in line for kw in ("抽選", "応募", "予約", "先着")):
         return None
-    dates = [d for d in _upcoming_dates(line, today) if 0 <= (d - today).days <= 60]
-    if not dates:
+    start, end = _apply_period(line, today)
+    if not end:
         return None
     return {
         "channel": channel,
         "product": _item_short_name(item),
-        "apply_start": min(dates).isoformat() if len(dates) > 1 else None,
-        "apply_end": max(dates).isoformat(),
+        "apply_start": start.isoformat() if start else None,
+        "apply_end": end.isoformat(),
     }
 

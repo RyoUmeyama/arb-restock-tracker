@@ -136,10 +136,8 @@ class TestAltemaMatch(unittest.TestCase):
             25500,
         )
 
-    def test_forward_match_still_prefers_shortest(self):
-        """順方向（監視名が短くaltema側が装飾付き）では従来どおり最短を採る。"""
-        prices = {"ホワイトフレア＋おまけ付き限定セット": 30000, "ホワイトフレアBOX": 17000}
-        self.assertEqual(cs.match_altema_price("ポケカ ホワイトフレア", prices), 17000)
+    # ※ test_forward_match_still_prefers_shortest は test_shortest_candidate_for_partial と
+    #   完全に同一だったため削除（2026-09-09 監査）
 
 
 class TestRakutenParse(unittest.TestCase):
@@ -775,9 +773,13 @@ class TestReleaseCalendar(unittest.TestCase):
         self.assertNotIn("拡張パック「過去の弾」", titles)
 
     def test_excludes_already_watched(self):
-        watched = [cs._normalize_box_name("ストームエメラルダ")]
+        # 本番と同じ形（check_stock側で _normalize_box_name 済みの監視名）で照合できること。
+        # 2026-09-09 監査: 以前は素の「ストームエメラルダ」を渡していたため通っていたが、
+        # 本番の "ストームエメラルダ抽選/予約まとめanime-matsuri" とは一度も一致していなかった
+        watched = [cs._normalize_box_name("ポケカ ストームエメラルダ 抽選/予約まとめ（anime-matsuri）")]
         titles = [t for _, t, _, _ in self._run(watched)]
         self.assertNotIn("拡張パック「ストームエメラルダ」", titles)
+        self.assertIn("「30th CELEBRATION FUTURISTIC BOX」", titles, "無関係な銘柄は残る")
 
     def test_sorted_by_release_date(self):
         dates = [d for d, _, _, _ in self._run()]
@@ -1053,12 +1055,25 @@ class TestPokecenArticleSummary(unittest.TestCase):
 
 
 def test_heartbeat_detail_is_multiline():
-    """日次ヘルスレポートも1情報=1行（壁形式に戻らない。2026-08-21統一の回帰）。"""
-    ns, alerts = {}, []
-    cs.append_heartbeat({}, ns, alerts, {"ok": ["a", "b"], "fail": [("c", "https://x/")], "suppressed": 0})
-    hb = [a for a in alerts if "ヘルス" in a[0]["name"]]
-    if not hb:  # JST9時前は送信されない仕様のためスキップ相当
-        return
+    """日次ヘルスレポートも1情報=1行（壁形式に戻らない。2026-08-21統一の回帰）。
+
+    2026-09-09 監査: 実行時刻がJST9時前だと早期returnで何も検証しないテストだったため、
+    check_stock が参照する datetime を固定（JST10時・火曜）して常に検証する。
+    """
+    from datetime import datetime as _dt
+    class FakeDT(_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 8, 10, 0, tzinfo=tz)
+    orig = cs.datetime
+    cs.datetime = FakeDT
+    try:
+        ns, alerts = {}, []
+        cs.append_heartbeat({}, ns, alerts, {"ok": ["a", "b"], "fail": [("c", "https://x/")], "suppressed": 0})
+        hb = [a for a in alerts if "ヘルス" in a[0]["name"]]
+    finally:
+        cs.datetime = orig
+    assert hb, "JST10時固定なのでヘルスレポートは必ず生成される"
     detail = hb[0][1]
     assert detail.startswith("\n・")
     assert " ／ " not in detail
@@ -1500,3 +1515,274 @@ class TestPokecardPeripheralNotNotified(unittest.TestCase):
     def test_known_keys_not_repeated(self):
         products = self._products()
         self.assertEqual(cs._pokecard_fresh_keys(products, sorted(products), sorted(products)), [])
+
+
+# ===== 2026-09-09 監査で確認した不具合の回帰テスト（links.py / rules.py / config.py）=====
+
+class TestAuditStoreLinkSiblingHeadings(unittest.TestCase):
+    """H1: 先頭18字を共有する兄弟見出しが全て先頭行のリンクに解決されていた。"""
+
+    HTML = ('<h3>30th CELEBRATION カードセット エーフィ・ブラッキーが予約できるAmazon抽選情報</h3>'
+            '<p><a href="https://amzn.to/AAA">Amazon</a></p>'
+            '<h3>30th CELEBRATION カードセット リザードン・ピカチュウが予約できるAmazon抽選情報</h3>'
+            '<p><a href="https://amzn.to/BBB">Amazon</a></p>')
+
+    def test_each_sibling_resolves_to_own_link(self):
+        self.assertEqual(cs.resolve_store_link(
+            self.HTML, "30th CELEBRATION カードセット リザードン・ピカチュウが予約できるAmazon抽選情報"),
+            "https://amzn.to/BBB")
+        self.assertEqual(cs.resolve_store_link(
+            self.HTML, "30th CELEBRATION カードセット エーフィ・ブラッキーが予約できるAmazon抽選情報"),
+            "https://amzn.to/AAA")
+
+    def test_repeated_occurrence_picks_one_with_link_after(self):
+        # 同じ見出しが目次と本文に2回出て、リンクは本文側にだけある構造
+        html = ('<li>【ヨドバシ】30th BOX 抽選受付</li>' + "x" * 2000 +
+                '<h3>【ヨドバシ】30th BOX 抽選受付</h3><a href="https://www.yodobashi.com/product/9/">買う</a>')
+        self.assertEqual(cs.resolve_store_link(html, "【ヨドバシ】30th BOX 抽選受付"),
+                         "https://www.yodobashi.com/product/9/")
+
+    def test_no_link_after_line_returns_none(self):
+        # 行の後ろに一致リンクが無ければ前方の（別行の）リンクを推測で拾わない
+        html = ('<a href="https://www.yodobashi.com/product/OTHER/">別商品</a>'
+                '<p>【ヨドバシ】30th BOX 抽選受付</p>')
+        self.assertIsNone(cs.resolve_store_link(html, "【ヨドバシ】30th BOX 抽選受付"))
+
+
+class TestAuditStoreDomainHostMatch(unittest.TestCase):
+    """H2: ストアドメイン判定がURL全体の部分一致で、SNSのアカウントURLを通していた。"""
+
+    def test_sns_account_urls_rejected(self):
+        for u in ("https://twitter.com/pokemoncenterPR", "https://x.com/yamada_official",
+                  "https://twitter.com/hobby_zone_web", "https://twitter.com/amazon_jp",
+                  "https://evil.example/?ref=amazon.co.jp"):
+            self.assertIsNone(cs._clean_store_url(u), u)
+
+    def test_real_store_urls_accepted(self):
+        for u in ("https://www.pokemoncenter-online.com/lottery/",
+                  "https://www.yodobashi.com/product/1/", "https://amzn.to/abc",
+                  "https://www.amazon.co.jp/dp/B0X", "https://books.rakuten.co.jp/rb/1/",
+                  "https://www.biccamera.com/bc/item/1/", "https://www.yamada-denkiweb.com/1",
+                  "https://www.1999.co.jp/10001", "https://7net.omni7.jp/detail/1"):
+            self.assertEqual(cs._clean_store_url(u), u, u)
+
+    def test_hint_domains_are_hosts(self):
+        import links, config
+        for name, domains in config.STORE_NAME_HINTS.items():
+            for d in domains:
+                self.assertIn(".", d, f"{name}: ホスト名で指定すること ({d})")
+        # 店舗名ヒント経路もホスト一致（twitter.com/pokemoncenterPR は不一致）
+        html = ('<p>ポケモンセンターで抽選受付</p>'
+                '<a href="https://twitter.com/pokemoncenterPR">X</a>'
+                '<a href="https://www.pokemoncenter-online.com/lottery/">応募</a>')
+        self.assertEqual(links.resolve_store_link(html, "ポケモンセンターで抽選受付"),
+                         "https://www.pokemoncenter-online.com/lottery/")
+
+
+class TestAuditLotteryDeadline(unittest.TestCase):
+    """H3: 行内の最大日付を締切にしていたため、発売日・当選発表日が締切として台帳に入っていた。"""
+
+    ITEM = {"name": "ポケカ 30th CELEBRATION 抽選/予約まとめ（anime-matsuri）"}
+
+    def _x(self, line, today=None):
+        from datetime import date
+        return cs.extract_lottery_candidate(line, self.ITEM, today or date(2026, 8, 30),
+                                            cs.config.STORE_NAME_HINTS)
+
+    def test_release_date_before_apply_range_not_deadline(self):
+        c = self._x("【ヨドバシ】9月16日発売「30th」BOX 抽選受付 9月1日〜9月8日")
+        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-09-01", "2026-09-08"))
+
+    def test_winner_announcement_not_deadline(self):
+        c = self._x("ヨドバシ 抽選受付 9月1日〜9月8日 当選発表9月12日")
+        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-09-01", "2026-09-08"))
+
+    def test_release_date_only_yields_none(self):
+        # 応募期間が読めない行（発売日しか無い）は締切不明＝台帳に登録しない
+        self.assertIsNone(self._x("ヨドバシで9月16日発売のBOXを抽選予約受付中"))
+
+    def test_order_period_not_deadline(self):
+        c = self._x("ポケモンセンター 応募受付期間 9月11日〜9月16日 注文期間 9月30日〜10月6日")
+        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-09-11", "2026-09-16"))
+
+    def test_single_until_date_still_works(self):
+        c = self._x("【ヨドバシ】抽選受付開始 9月20日まで")
+        self.assertEqual((c["apply_start"], c["apply_end"]), (None, "2026-09-20"))
+
+
+class TestAuditEndedAndNavLines(unittest.TestCase):
+    """M1: 終了・悪化の行とサイドバー件数が実質情報として通っていた。"""
+
+    def test_ended_lines_not_actionable(self):
+        from datetime import date
+        for l in ("抽選受付は終了しました", "販売終了のお知らせ", "在庫切れになりました",
+                  "受付終了のご案内です", "30th BOX 売り切れとなりました"):
+            self.assertFalse(cs._is_actionable_line(l, date(2026, 9, 9)), l)
+
+    def test_nav_counter_lines_not_actionable(self):
+        for l in ("抽選販売・予約 (46)", "再販・入荷情報（12）", "予約受付中 (3)"):
+            self.assertFalse(cs._is_actionable_line(l), l)
+
+    def test_resale_after_soldout_still_actionable(self):
+        # 「完売」はマーカーに入れない（完売後の再販は正当なチャンス）
+        self.assertTrue(cs._is_actionable_line("完売していた30th BOXがヨドバシで再販決定"))
+        self.assertTrue(cs._is_actionable_line("【ヨドバシ】30th BOX 抽選受付開始 9月8日まで"))
+
+
+class TestAuditFallbackSearchQuery(unittest.TestCase):
+    """M3: 店舗名がクエリに残る／'/'残留で楽天のパスが壊れる／「〜中旬頃から」が残る。"""
+
+    ITEM = {"name": "ポケカ 30th CELEBRATION 抽選/予約まとめ（anime-matsuri）"}
+
+    def test_store_name_removed_and_slash_encoded(self):
+        from urllib.parse import unquote
+        url = cs.fallback_search_url("楽天ブックスで 30th CELEBRATION BOX 抽選/予約 受付", self.ITEM)
+        self.assertTrue(url.startswith("https://search.rakuten.co.jp/search/mall/"))
+        q = url[len("https://search.rakuten.co.jp/search/mall/"):]
+        self.assertTrue(q.endswith("/") and "/" not in q[:-1], url)  # クエリ内の"/"はエンコード済み
+        self.assertNotIn("楽天", unquote(q))
+        self.assertIn("30th CELEBRATION BOX", unquote(q))
+
+    def test_store_without_template_goes_to_store_home(self):
+        # ビックカメラの抽選をAmazon検索に飛ばさない
+        self.assertEqual(cs.fallback_search_url("ビックカメラで 30th CELEBRATION BOX 抽選受付", self.ITEM),
+                         "https://www.biccamera.com/")
+        import config
+        for name in config.STORE_NAME_HINTS:
+            self.assertTrue(name in config.STORE_SEARCH_KEY or name in config.STORE_HOME_URL,
+                            f"{name}: 検索テンプレートかトップURLのどちらかが必要")
+
+    def test_vague_month_period_stripped(self):
+        from urllib.parse import unquote
+        url = cs.fallback_search_url(
+            "2026年6月中旬頃から抽選予約開始Amazonで招待リクエスト(抽選)予約受付開始", self.ITEM)
+        q = unquote(url.split("k=")[1])
+        self.assertNotIn("2026", q)
+        self.assertNotIn("中旬", q)
+        self.assertNotIn("Amazon", q)
+
+    def test_no_store_still_amazon(self):
+        url = cs.fallback_search_url("30th CELEBRATION BOX の抽選受付が開始", self.ITEM)
+        self.assertIn("amazon.co.jp/s?k=", url)
+
+
+class TestAuditReverseYearRollover(unittest.TestCase):
+    """M4: 1月に見た「12月26日に発売」が11ヶ月先の未来と解釈されていた。"""
+
+    def test_far_future_month_is_previous_year(self):
+        from datetime import date
+        self.assertEqual(cs._upcoming_dates("12月26日に発売", date(2026, 1, 10)), [date(2025, 12, 26)])
+
+    def test_forward_rollover_unchanged(self):
+        from datetime import date
+        self.assertEqual(cs._upcoming_dates("1月10日まで受付", date(2026, 12, 20)), [date(2027, 1, 10)])
+
+
+class TestAuditDeckWithoutDate(unittest.TestCase):
+    """M5: 日付のないデッキ系の予約開始告知（公式info）が落ちていた。"""
+
+    def test_pokeca_deck_reservation_without_date_allowed(self):
+        from datetime import date
+        self.assertTrue(cs._is_actionable_line(
+            "30th CELEBRATION デッキビルドBOX 予約受付開始", date(2026, 9, 9), is_pokeca=True))
+
+    def test_pokeca_deck_status_without_date_still_excluded(self):
+        from datetime import date
+        self.assertFalse(cs._is_actionable_line(
+            "構築デッキ「スターターセットex」好評発売中", date(2026, 9, 9), is_pokeca=True))
+
+    def test_non_pokeca_deck_still_excluded(self):
+        from datetime import date
+        self.assertFalse(cs._is_actionable_line(
+            "スターターセット 予約受付開始", date(2026, 9, 9), is_pokeca=False))
+
+    def test_deck_with_far_date_still_excluded(self):
+        from datetime import date
+        self.assertFalse(cs._is_actionable_line(
+            "構築デッキ「スターターセットex」予約受付 2027年3月1日発売", date(2026, 9, 9), is_pokeca=True))
+
+
+class TestAuditAccessoryPhrases(unittest.TestCase):
+    """L2: 「初回限定」「ラバーマット」の単語除外が本体商品の告知まで殺していた。"""
+
+    def test_first_edition_bonus_allowed(self):
+        from datetime import date
+        self.assertTrue(cs._is_actionable_line(
+            "初回限定特典付き 30th CELEBRATION BOX 予約受付開始", date(2026, 9, 9), is_pokeca=True))
+
+    def test_oripa_ad_still_rejected(self):
+        self.assertFalse(cs._is_actionable_line("初回限定5,000PT購入で最大12,350PTボーナス増量"))
+        self.assertFalse(cs._is_actionable_line("初回限定クーポン配布中！オリパ購入で還元"))
+
+    def test_supply_as_accessory_allowed(self):
+        from datetime import date
+        self.assertTrue(cs._is_actionable_line(
+            "ラバーマット付き 30th CELEBRATION プレミアムデッキセット 抽選受付",
+            date(2026, 9, 9), is_pokeca=True))
+
+    def test_supply_itself_still_excluded(self):
+        from datetime import date
+        self.assertFalse(cs._is_actionable_line(
+            "ラバーマット メガレックウザ 予約受付開始", date(2026, 9, 9), is_pokeca=True))
+        self.assertFalse(cs._is_actionable_line(
+            "デッキシールド ピカチュウが7月31日に発売", date(2026, 7, 8), is_pokeca=True))
+
+
+class TestAuditAffiliateUnwrapAndAnchors(unittest.TestCase):
+    """L3/L4: 多段アフィリエイトの剥がし・Amazon URLのurl=乗っ取り・単一引用符href。"""
+
+    def test_multi_level_unwrap(self):
+        url = ("https://af.moshimo.com/af/c/click?a_id=1&url=https%3A%2F%2Fhb.afl.rakuten.co.jp%2Fhgc%2Fx%2F"
+               "%3Fpc%3Dhttps%253A%252F%252Fbooks.rakuten.co.jp%252Frb%252F123%252F")
+        self.assertEqual(cs._unwrap_affiliate(url), "https://books.rakuten.co.jp/rb/123/")
+
+    def test_non_affiliate_url_param_not_hijacked(self):
+        u = "https://www.amazon.co.jp/dp/B0X?url=https://evil.example/"
+        self.assertEqual(cs._unwrap_affiliate(u), u)
+        self.assertEqual(cs._clean_store_url(u), u)
+
+    def test_single_quoted_href_anchor(self):
+        anchors = cs.extract_anchors("<a href='https://www.amazon.co.jp/dp/B0X'>これは十文字以上のアンカーテキスト</a>")
+        self.assertEqual(anchors, [("これは十文字以上のアンカーテキスト", "https://www.amazon.co.jp/dp/B0X")])
+        html = "<p>【ヨドバシ】30th BOX 抽選受付</p><a href='https://www.yodobashi.com/product/5/'>買う</a>"
+        self.assertEqual(cs.resolve_store_link(html, "【ヨドバシ】30th BOX 抽選受付"),
+                         "https://www.yodobashi.com/product/5/")
+
+
+class TestAuditWatchedExclusionProductionShape(unittest.TestCase):
+    """M2: 発売カレンダーの監視済み除外が本番の名前形では一度も一致していなかった。"""
+
+    def _p(self, title, rdate="2026年 9月16日（水）", price="360円（税込）"):
+        return {"title": title, "releaseDate": rdate, "price": price, "link": ""}
+
+    def test_real_watch_names_exclude_official_titles(self):
+        from datetime import date
+        import config
+        watched = [cs._normalize_box_name(it["name"]) for it in config.WATCH_ITEMS]
+        products = {
+            "a": self._p("拡張パック「30th CELEBRATION」"),
+            "b": self._p("MEGA 拡張パック「30th CELEBRATION」"),
+            "c": self._p("ハイクラスパック「MEGAドリームex」", price="550円（税込）"),
+            "d": self._p("拡張パック「まったく新しい弾」"),
+        }
+        titles = [t for _, t, _, _ in cs.upcoming_releases(products, date(2026, 8, 30), watched, 3000, 120)]
+        self.assertEqual(titles, ["拡張パック「まったく新しい弾」"])
+
+    def test_core_name_normalization(self):
+        import rules
+        # 生の監視名・正規化済みの監視名・公式商品名の3形が同じコア名に揃う
+        self.assertEqual(rules._core_product_name(
+            "ポケカ 30th CELEBRATION 抽選/予約まとめ（anime-matsuri）"), "30thCELEBRATION")
+        self.assertEqual(rules._core_product_name("30thCELEBRATION抽選/予約まとめanime-matsuri"),
+                         "30thCELEBRATION")
+        self.assertEqual(rules._core_product_name("拡張パック「30th CELEBRATION」"), "30thCELEBRATION")
+
+    def test_distinct_product_sharing_prefix_not_excluded(self):
+        # 監視 "30thCELEBRATION" ⊂ 商品 "30thCELEBRATIONFUTURISTIC" の逆方向では除外しない
+        # （FUTURISTIC BOX は別商品・別抽選。TestReleaseMilestone も同じ前提）
+        from datetime import date
+        import config
+        watched = [cs._normalize_box_name(it["name"]) for it in config.WATCH_ITEMS]
+        products = {"a": self._p("「30th CELEBRATION FUTURISTIC BOX」", price="27,500円（税込）")}
+        titles = [t for _, t, _, _ in cs.upcoming_releases(products, date(2026, 8, 30), watched, 3000, 120)]
+        self.assertEqual(titles, ["「30th CELEBRATION FUTURISTIC BOX」"])

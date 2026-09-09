@@ -47,11 +47,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90  # ジョブ内ループ(約60分)＋余裕。暴走時の保護
     steps:
+      # 【2026-09-09 Node 20 非推奨対応】actions/checkout・setup-python・cache を
+      #  Node 24 対応のメジャーへ更新（checkout v7 / setup-python v7 / cache v6）。
+      #  cache のキー名は据え置き（変えると保存済みの状態を引き継げなくなる）。
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Restore stock state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: stock_state.json
           # page_update のハッシュ計算を変えたらこのキーのバージョンを上げる(v4→v5...)。
@@ -61,7 +64,7 @@ jobs:
             gunpla-stock-state-v4-
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -80,10 +83,10 @@ jobs:
           TEST_NOTIFY: ${{ github.event.inputs.test_notify }}
           # 手動実行時に debug_discovery=1 で自動発見の到達性検証のみ実行
           DEBUG_DISCOVERY: ${{ github.event.inputs.debug_discovery }}
-          # 【2026-07-06 カバレッジ拡大】cronは15分指定でも実測60〜90分間隔（深夜は最大4.5時間）
+          # 【2026-07-06 カバレッジ拡大】cron（当時は15分指定）でも実測60〜90分間隔（深夜は最大4.5時間）
           # に間引かれると週末の実測で判明。1起動を約60分粘る設計にして間引きの隙間を埋める:
-          # 8パス×7分間隔≈1時間。concurrencyグループで同時実行は防がれ、待機中のcronが
-          # 前ジョブ終了直後に連結して起動する＝ほぼ連続カバー。
+          # 8パス×7分間隔≈1時間（実測68〜75分）。concurrencyグループで同時実行は防がれ、待機中のcronが
+          # 前ジョブ終了直後に連結して起動する＝ほぼ連続カバー。cronは2026-08-19に毎時2回(:07/:37)へ整理。
           # 監視先への負荷は1ページあたり7〜8分に1回（一般的な在庫監視サービスと同等）。
           LOOP_COUNT: '8'
           LOOP_INTERVAL: '420'
@@ -104,7 +107,7 @@ jobs:
           fi
 
       - name: Save stock state
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         if: always()
         with:
           path: stock_state.json

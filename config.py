@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-監視設定 — 転売検証用 在庫トラッカー（小額モデル検証 Q1 用）
+監視設定 — TCG（ポケカ別格・ワンピ/DBFW/遊戯王/コナン）の再販・抽選・予約 検知エンジン
 
-目的: docs/07_minimal_validation.md / docs/08_broad_screening.md の Q1「入手再現性」を
-      実測するための入手監視。狙いの商品が正規店で定価・在庫ありになった瞬間を検知して即通知し、
-      争奪戦に参加できる状態を作る。
+目的: 狙いのBOX/セットが正規店で定価入手できる機会（在庫復活・抽選受付・予約開始・再販告知）を
+      検知して即通知し、争奪戦に参加できる状態を作る。検知結果は arb-lottery-ledger（応募台帳）へ
+      抽選候補として連携する。ガンプラ監視は2026-07-10に除外済み（戦略の主軸はTCG）。
 
 複数サイト・複数判定方式に対応:
-  各監視品(WATCH_ITEMS)は "method" で在庫判定方式を指定する。
-    - "gdb_soldout": GunplaDatabase。shop_status_container ブロックの soldout/「売切」で判定（ガンプラ用）
-    - "toei_stock_status": 東映アニメ公式。埋め込みJSONの stock_status の値で判定（OP-16用）
-                          stock_status が "0" 以外なら在庫あり。
+  各監視品(WATCH_ITEMS)は "method" で判定方式を指定する。
+    - "toei_stock_status": 東映アニメ公式。埋め込みJSONの stock_status で在庫判定（"0"以外=在庫あり）
+    - "page_update": 集約ページ（anime-matsuri / nyuka-now / 公式info / カードラボ）の
+                     実質情報行の差分で再販告知・抽選受付を検知
+    - "pokecard_official_list" / "onepiece_news" / "pokecen_news_ids": 公式API・記事IDの新着差分
+    - "gdb_soldout": GunplaDatabase（旧ガンプラ用。判定関数は check_stock.py に残置・現在は未使用）
   新サイトを足す場合は check_stock.py に判定関数を追加し、method を増やす。
+  判定規則の本体は rules.py、リンク解決は links.py（仕様は NOTIFICATION_RULES.md）。
 """
 
 # カードラボ等の実店舗ページ用の必須キーワード。
@@ -457,7 +460,11 @@ NON_CARD_CATEGORY_TAGS = [
 ]
 MAGAZINE_CARD_MARKERS = ["プロモカード", "カード付", "付録カード", "特典カード", "カード付録"]
 # 状態の継続を示す文言（新しいチャンスではないので通知しない）
-STATUS_QUO_MARKERS = ["販売継続中", "在庫継続", "販売中です"]
+STATUS_QUO_MARKERS = ["販売継続中", "在庫継続", "販売中です",
+                      # 終了・悪化を示す文言（2026-09-09 監査: 「抽選受付は終了しました」
+                      # 「在庫切れになりました」が行動語だけで通知されていた）。
+                      # 「完売」は「完売後の再販」のような正当な行に出るため入れない
+                      "は終了", "終了しました", "受付終了", "販売終了", "在庫切れ", "売り切れ"]
 
 DECK_PRODUCT_KEYWORDS = ["スターターセット", "構築デッキ", "デッキビルド"]
 # 例外: スタートデッキ（スタートデッキ100等）は再販でも人気のため常に通知対象。
@@ -469,11 +476,24 @@ INITIAL_SALE_WINDOW_DAYS = 60
 MAX_PRODUCT_AGE_DAYS = 548  # ≒1年半
 
 # 遷移先ストアURLとして認めるドメイン（追加行の近傍リンクから抽出。これ以外は載せない＝
-# Googleフォーム・SNS等のノイズURL混入防止）
+# Googleフォーム・SNS等のノイズURL混入防止）。
+# ホスト名で照合する（host == d または host が ".d" で終わる。links._host_matches）。
+# 2026-09-09 監査: 旧来は "pokemon"/"yamada"/"hobby" 等の断片をURL全体の部分一致で見ており、
+# twitter.com/pokemoncenterPR や x.com/yamada_official がストアURLとして採用されていた。
+# ※ホビーサーチの実ドメインは 1999.co.jp（hobbysearch.jp は存在しない）。
+# ※イオン系はホストを確認できなかったため未登録（旧 "aeon" 断片は店舗名ヒントからも未参照）。
 STORE_DOMAINS = [
-    "amazon.co.jp", "amzn.to", "rakuten.co.jp", "yodobashi.com", "animate", "amiami",
-    "biccamera", "yamada", "7net", "omni7", "hmv", "tsutaya", "store.toei-anim",
-    "pokemon", "hobby", "joshin", "edion", "lawson", "aeon", "toysrus", "surugaya",
+    "amazon.co.jp", "amzn.to", "amzn.asia", "rakuten.co.jp", "yodobashi.com",
+    "animate-onlineshop.jp", "amiami.jp", "biccamera.com", "yamada-denkiweb.com",
+    "omni7.jp", "hmv.co.jp", "tsite.jp", "toei-anim.co.jp",
+    "pokemoncenter-online.com", "pokemon-card.com", "1999.co.jp",
+    "joshinweb.jp", "edion.com", "lawson.co.jp", "toysrus.co.jp", "suruga-ya.jp",
+]
+# 遷移先を url=/pc= 等のクエリに持つ既知のアフィリエイト中継ホストだけ剥がす
+# （2026-09-09 監査: Amazon等の商品URLに url= パラメータがあると乗っ取られていた）
+AFFILIATE_HOSTS = [
+    "hb.afl.rakuten.co.jp", "afl.rakuten.co.jp", "af.moshimo.com",
+    "ck.jp.ap.valuecommerce.com", "dalr.valuecommerce.com", "click.linksynergy.com",
 ]
 # 確実な直リンクが取れない行に付ける「ストア検索URL」のテンプレート。
 # 集約ページのURLだけでは行動につながらないため、商品名での検索結果に直接飛ばす。
@@ -493,6 +513,30 @@ STORE_SEARCH_KEY = {
     "ポケモンセンター": "pokemoncenter", "ポケセン": "pokemoncenter",
     "あみあみ": "amiami", "アニメイト": "animate", "駿河屋": "surugaya",
 }
+# 検索テンプレートが無い店舗のトップURL。行にその店舗名があるのに Amazon検索へ飛ばすと
+# 「ビックカメラの抽選なのにAmazon検索」という誤誘導になるため（2026-09-09 監査）。
+STORE_HOME_URL = {
+    "ビックカメラ": "https://www.biccamera.com/",
+    "ヤマダ": "https://www.yamada-denkiweb.com/",
+    "セブン": "https://7net.omni7.jp/",
+    "HMV": "https://www.hmv.co.jp/",
+    "TSUTAYA": "https://store-tsutaya.tsite.jp/",
+    "東映": "https://store.toei-anim.co.jp/",
+    "ローソン": "https://www.lawson.co.jp/",
+    "トイザらス": "https://www.toysrus.co.jp/",
+    "ジョーシン": "https://joshinweb.jp/",
+    "エディオン": "https://www.edion.com/",
+    "ホビーサーチ": "https://www.1999.co.jp/",
+}
+# 検索クエリから落とす店舗の呼称（長い表記を先に。STORE_NAME_HINTS のキーも合わせて落とす）。
+# 「楽天ブックス 30th BOX」のように店舗名がクエリに残ると検索精度が落ちる（2026-09-09 監査）
+STORE_QUERY_STRIP_WORDS = [
+    "ポケモンセンターオンライン", "ポケセンオンライン", "楽天ブックス", "楽天市場",
+    "アニメイトオンライン", "Amazon.co.jp", "ヨドバシカメラ", "ヨドバシ.com",
+    "ビックカメラ.com", "ヤマダウェブコム", "ヤマダ電機", "セブンネット", "セブン-イレブン",
+    "セブンイレブン", "トイザらスオンライン", "HMV&BOOKS", "ジョーシンweb", "Joshin",
+    "東映ストア", "東映アニメーション", "Loppi",
+]
 
 # 東映在庫スイープで「×からの変化」でも在庫復活とみなさない値（誤報ガード）。
 # 例: ×→販売終了 は入荷ではない。
@@ -500,15 +544,17 @@ TOEI_SWEEP_IGNORE = ["終了", "未定", "取扱なし", "取り扱いなし"]
 
 # 行内の店舗名→URLドメインの対応。行に店舗名があるときはドメインが一致するリンクだけを
 # 採用する（隣の行のリンクを誤って拾う「ズレ」の防止）。
+# 値はホスト名（links._host_matches でホスト一致。URL全体の部分一致ではない。2026-09-09 監査）
 STORE_NAME_HINTS = {
-    "Amazon": ["amazon", "amzn"], "アマゾン": ["amazon", "amzn"],
-    "楽天": ["rakuten"], "ヨドバシ": ["yodobashi"],
-    "ポケモンセンター": ["pokemoncenter"], "ポケセン": ["pokemoncenter"],
-    "あみあみ": ["amiami"], "アニメイト": ["animate"], "駿河屋": ["surugaya"],
-    "ビックカメラ": ["biccamera"], "ヤマダ": ["yamada"], "セブン": ["7net", "omni7"],
-    "HMV": ["hmv"], "TSUTAYA": ["tsutaya"], "東映": ["toei-anim"],
-    "ローソン": ["lawson"], "トイザらス": ["toysrus"], "ジョーシン": ["joshin"],
-    "エディオン": ["edion"], "ホビーサーチ": ["hobbysearch"],
+    "Amazon": ["amazon.co.jp", "amzn.to", "amzn.asia"],
+    "アマゾン": ["amazon.co.jp", "amzn.to", "amzn.asia"],
+    "楽天": ["rakuten.co.jp"], "ヨドバシ": ["yodobashi.com"],
+    "ポケモンセンター": ["pokemoncenter-online.com"], "ポケセン": ["pokemoncenter-online.com"],
+    "あみあみ": ["amiami.jp"], "アニメイト": ["animate-onlineshop.jp"], "駿河屋": ["suruga-ya.jp"],
+    "ビックカメラ": ["biccamera.com"], "ヤマダ": ["yamada-denkiweb.com"], "セブン": ["omni7.jp"],
+    "HMV": ["hmv.co.jp"], "TSUTAYA": ["tsite.jp"], "東映": ["toei-anim.co.jp"],
+    "ローソン": ["lawson.co.jp"], "トイザらス": ["toysrus.co.jp"], "ジョーシン": ["joshinweb.jp"],
+    "エディオン": ["edion.com"], "ホビーサーチ": ["1999.co.jp"],
 }
 PAGE_LINES_KEEP = 400    # stateに保存する行数上限
 DIFF_LINES_SHOWN = 6     # 通知本文に載せる新規行の最大数
@@ -645,7 +691,10 @@ DIGEST_EXCLUDE_MARKERS = ["収録カードリスト", "当たりカード", "買
                           "トレーナーズリーグ", "オーガナイザー",
                           # 2026-08-31 一斉監査で追加。
                           # まとめページ埋め込みのオリパ・ポイ活広告（行動語を含むため素通りしていた）
-                          "【広告】", "オリパ", "友達追加", "PT購入", "チャージで", "初回限定",
+                          # 「初回限定」単体は「初回限定特典付き…予約受付開始」も殺すため
+                          # 広告固有の言い回しに限定（2026-09-09 監査）
+                          "【広告】", "オリパ", "友達追加", "PT購入", "チャージで",
+                          "初回限定クーポン", "初回限定PT", "初回限定ボーナス",
                           # 公式の大会・イベント運営系（商品入手と無関係）
                           "招待選手", "チャンピオンシップ", "ゲスト参加",
                           "先着エントリーの受付", "エントリーキャンペーン", "ポケカジム",

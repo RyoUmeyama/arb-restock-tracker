@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-転売検証 在庫チェッカー（小額モデル検証 Q1 用）
+転売検証 在庫トラッカー（TCG: ポケカ別格・ワンピ/DBFW ほか）
 
-毎回:
-  1. WATCH_ITEMS の各商品を、item["method"] に応じた方式で取得・在庫判定
-     - gdb_soldout: GunplaDatabase（ガンプラ。soldout/「売切」で判定）
-     - toei_stock_status: 東映アニメ公式（OP-16等。埋め込みJSONの stock_status で判定）
-  2. 「前回=在庫なし → 今回=在庫あり」に変化した商品だけ通知（メール＋Discord）
+毎パス:
+  1. WATCH_ITEMS（＋自動発見で登録した動的監視）の各項目を item["method"] に応じて判定
+     - toei_stock_status: 東映アニメ公式の在庫（埋め込みJSONの stock_status）→ 在庫なし→ありで通知
+     - page_update: 集約ページ（anime-matsuri / nyuka-now / 公式info / カードラボ）の実質情報行の差分
+     - pokecard_official_list / onepiece_news / pokecen_news_ids: 公式API・記事IDの新着差分
+     方式ごとの処理は METHOD_HANDLERS（_process_<method>）に分かれている
+  2. 変化を通知（メール＋Discord）。通知が届いてから状態を保存する（失敗時は次パスで再通知）
+  3. 朝1回の日次ヘルスレポート（生存確認・取得不能の内訳・直近24hの抑制開示）
+  4. 店舗・締切が確定した抽選は data/detected_lotteries.json へ書き出し、応募台帳
+     （arb-lottery-ledger）が取り込む
 
-新サイトを足す場合は _check_<method> 関数を追加し、config の method を増やす。
+判定規則は rules.py、リンク解決は links.py、HTTP は netutil.py（仕様: NOTIFICATION_RULES.md）。
 """
 
 import os
@@ -18,7 +23,6 @@ import json
 import time
 import hashlib
 from datetime import datetime, timedelta
-from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -402,15 +406,16 @@ def fetch_pokecard_new_products():
     """ポケカ公式の商品APIから現在の商品リストを取得する。
     resultAPI.php の4カテゴリ(expansion/construction/others/peripheral)を叩き、
     各商品を (productTitle, releaseDate) のキーで返す。
-    返り値: (products: dict[key->info], ok: bool)。ok=False は全カテゴリ取得失敗。"""
+    返り値: (products: dict[key->info], ok: bool)。ok=False はいずれかのカテゴリの取得失敗
+    （一部失敗を ok 扱いにすると、失敗カテゴリの商品が基準から消え、復旧した次パスで
+    旧商品が「新商品」として誤通知される。2026-09-09 監査 H3。東映側の all_ok と同じ教訓）。"""
     base = "https://www.pokemon-card.com/products/resultAPI.php"
     products = {}
-    any_ok = False
+    all_ok = True
     for ptype in config.POKECARD_PRODUCT_TYPES:
         try:
             resp = http_get(base, params={"productType": ptype, "page": "1"})
             data = resp.json()
-            any_ok = True
             for p in data.get("products", []):
                 title = (p.get("productTitle") or "").strip()
                 rdate = (p.get("releaseDate") or "").strip()
@@ -431,8 +436,9 @@ def fetch_pokecard_new_products():
                 }
             time.sleep(config.REQUEST_INTERVAL)
         except Exception as e:
+            all_ok = False
             print(f"  ⚠ ポケカAPI取得失敗({ptype}): {e}")
-    return products, any_ok
+    return products, all_ok
 
 
 def fetch_onepiece_news():
@@ -623,11 +629,16 @@ def compute_page_signature(item):
         print(f"  ⚠ 抽出0行 {item['name']}（本文を拾えず・判定不能）")
         return None, None, False, None
 
-    # 正規化（重複除去・ソート）してハッシュ化。順序揺れに強くする。
-    normalized = "\n".join(sorted(set(picked)))
-    sig = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     # 差分表示用の行リスト（出現順・重複除去・肥大防止の上限あり）
-    lines = list(dict.fromkeys(picked))[: config.PAGE_LINES_KEEP]
+    uniq = list(dict.fromkeys(picked))
+    lines = uniq[: config.PAGE_LINES_KEEP]
+    if len(uniq) > config.PAGE_LINES_KEEP:
+        # 上限超過分は差分に載らない。sig も保存する行集合から計算しないと
+        # 「sig だけ変わり added=[]」で末尾の追加告知が黙殺される（2026-09-09 監査 L1）
+        print(f"  ⚠ {item['name']}: 抽出{len(uniq)}行が上限{config.PAGE_LINES_KEEP}を超過（末尾は監視外）")
+    # 正規化（重複除去・ソート）してハッシュ化。順序揺れに強くする。
+    normalized = "\n".join(sorted(set(lines)))
+    sig = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     return sig, lines, True, html
 
 
@@ -656,6 +667,19 @@ def compute_page_signature(item):
 
 
 DETECTED_LOTTERIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "detected_lotteries.json")
+
+
+def _detected_lotteries_summary():
+    """ヘルスレポート用: 台帳連携ファイルの件数と最終検知日を1行で返す。"""
+    try:
+        if not os.path.exists(DETECTED_LOTTERIES_FILE):
+            return "🔗 台帳連携: 検知抽選の書き出しなし（店舗・締切が確定した抽選が未検知）"
+        with open(DETECTED_LOTTERIES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        last = max((c.get("detected_at") or "" for c in data), default="")
+        return f"🔗 台帳連携: 検知抽選{len(data)}件（最終検知 {last or '不明'}）"
+    except Exception as e:
+        return f"🔗 台帳連携: 書き出しファイルを読めない（{e}）"
 
 
 def save_lottery_candidates(cands):
@@ -708,8 +732,12 @@ def save_state(state):
     # "_" 始まりのキーは実行中のみ有効な一時値（例: _pokecard_raw）。
     # stateファイル/Actionsキャッシュを肥大させないよう保存前に落とす。
     persisted = {k: v for k, v in state.items() if not k.startswith("_")}
-    with open(config.STATE_FILE, "w", encoding="utf-8") as f:
+    # tmp+replace で原子的に書く。timeout の SIGKILL 中に書き途中だと truncated JSON になり
+    # load_state が {} を返して全基準が静かにリセットされる（2026-09-09 監査 L2）
+    tmp = config.STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(persisted, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, config.STATE_FILE)
 
 
 def run_discovery(prev, new_state, alerts):
@@ -890,12 +918,25 @@ def run_price_screen(prev, new_state):
 
 
 
-def suggest_watch_candidates(prices, official_titles):
+def _all_watch_items(prev):
+    """手動定義（config.WATCH_ITEMS）＋自動発見で登録した動的監視。
+    ダイジェスト・監視候補提案・発売カレンダーはこちらを見る（config だけを見ると、
+    動的監視に入った新弾が「未監視」として再提案され、チャンスにも載らない）。"""
+    items = list(config.WATCH_ITEMS)
+    if config.AUTO_WATCH_ENABLED and prev is not None:
+        try:
+            items += auto_watch_items(prev)
+        except Exception as e:
+            print(f"  ⚠ 動的監視の読み出しに失敗（手動定義のみで続行）: {e}")
+    return items
+
+
+def suggest_watch_candidates(prices, official_titles, prev=None):
     """altema相場辞書から「買取が高いのに未監視」のポケカ銘柄を監視追加候補として返す。
     (1)価格帯フィルタ (2)ポケカ公式APIの現行商品リストとの照合（絶版＝正規入手ルートが
-    無い銘柄を除外） (3)既存WATCH_ITEMSとの双方向部分一致で未監視のみ、を通過したものを
+    無い銘柄を除外） (3)既存監視（手動＋動的）との双方向部分一致で未監視のみ、を通過したものを
     高値順に返す。official_titles はポケカ公式APIの商品タイトル一覧。"""
-    watched = [_normalize_box_name(it["name"]) for it in config.WATCH_ITEMS]
+    watched = [_normalize_box_name(it["name"]) for it in _all_watch_items(prev)]
     current = [_normalize_box_name(t) for t in official_titles]
     # official_titles は「発売から1年半以内」に呼び出し側で絞られている前提
     cands = []
@@ -921,7 +962,9 @@ def extract_opportunities(prev, new_state, today):
     以内の日付を含む行（過去の抽選履歴の行を日付で除外する）。
     返り値: ["[商品名] 行テキスト", ...]（重複除去・上限あり）。"""
     out, seen = [], set()
-    for item in config.WATCH_ITEMS:
+    # 自動発見で登録した動的監視（新弾のまとめページ）も対象にする。config だけを見ると
+    # 発見機能の目的そのものである新弾がダイジェストに載らない（2026-09-09 監査 M3）
+    for item in _all_watch_items(prev):
         if item.get("method") != "page_update" or "anime-matsuri" not in item.get("url", ""):
             continue
         val = new_state.get(item["key"]) or prev.get(item["key"])
@@ -1037,7 +1080,8 @@ def _track_discovery_failure(prev, new_state, alerts):
     streak = int(prev.get("am_discovery_fail_streak") or 0) + 1
     new_state["am_discovery_fail_streak"] = streak
     print(f"  ⚠ まとめページ自動発見 連続失敗{streak}日目")
-    if streak == 3:
+    # 3日目に警告、その後は1週間ごとに再警告（1通きりだと放置が続いても沈黙する）
+    if streak == 3 or (streak > 3 and (streak - 3) % 7 == 0):
         alerts.append((
             {"name": "⚠ まとめページ自動発見が3日連続失敗（新弾が監視に入らない状態）",
              "url": "https://github.com/RyoUmeyama/arb-restock-tracker/actions",
@@ -1056,8 +1100,11 @@ def append_heartbeat(prev, new_state, alerts, health):
     # 非発火パスでも維持する状態キー。auto_watch を含め忘れると、ヘルスレポート以外の
     # パスで保存のたびに動的監視リストが消える（2026-08-25 発見の潜在バグ）
     for carry_key in HEARTBEAT_CARRY_KEYS:
-        # パスの処理中に既に書き込まれたキー（suppressed_log等）を上書きしない
-        new_state.setdefault(carry_key, prev.get(carry_key))
+        # パスの処理中に既に書き込まれたキー（suppressed_log等）を上書きしない。
+        # prev に無いキーは None を書かない（am_pages_seen: null が保存されると
+        # 「初回」判定（キー不在）が壊れ、翌日の成功時に全ページを新規通知する。2026-09-09 監査 M1）
+        if carry_key in prev:
+            new_state.setdefault(carry_key, prev[carry_key])
     if now_jst.hour < 9 or prev.get("last_heartbeat") == today:
         return
     new_state["last_heartbeat"] = today
@@ -1070,6 +1117,9 @@ def append_heartbeat(prev, new_state, alerts, health):
     expected = [n for n, u in health["fail"] if _is_expected(u)]
     unexpected = [n for n, u in health["fail"] if not _is_expected(u)]
     lines = [f"監視{ok_n + len(health['fail'])}件: 正常{ok_n}件"]
+    # 台帳連携の生存確認: 検知抽選の書き出し件数と最終検知日（2026-09-09 監査: 連携経路が
+    # 実装以来8週間ゼロ件のまま誰にも見えていなかった）
+    lines.append(_detected_lotteries_summary())
     if expected:
         # 内訳を明記する（「何が・なぜ取れていないのか」が分からないと不安になるため）。
         exp_rakuten = sum(1 for n, u in health["fail"] if no_rakuten_id and "rakuten" in u)
@@ -1200,7 +1250,7 @@ def append_heartbeat(prev, new_state, alerts, health):
             expired_t = set(_expired_pokeca_titles(prev, new_state, now_jst.date()))
             titles = [k.split("|")[0] for k in officials
                       if _normalize_box_name(k.split("|")[0]) not in expired_t]
-            cands = [c for c in suggest_watch_candidates(prices, titles) if c not in set(sugg_seen)]
+            cands = [c for c in suggest_watch_candidates(prices, titles, prev) if c not in set(sugg_seen)]
             cands = cands[: config.SUGGEST_MAX]
             sugg_seen.extend(cands)
             new_state["suggested_seen"] = sugg_seen[-config.DIGEST_SEEN_KEEP:]
@@ -1246,7 +1296,7 @@ def report_release_calendar(prev, new_state, alerts, now_jst):
         for k, v in raw.items():
             products[k] = v
 
-        watched = [_normalize_box_name(it["name"]) for it in config.WATCH_ITEMS]
+        watched = [_normalize_box_name(it["name"]) for it in _all_watch_items(prev)]
         upcoming = upcoming_releases(
             products, now_jst.date(), watched,
             config.RELEASE_MIN_PRICE, config.RELEASE_WINDOW_DAYS,
@@ -1447,7 +1497,7 @@ def _pokecard_detail_lines(products):
 
 _POKECEN_PERIOD_RE = re.compile(
     r"(?:(20\d\d)年)?(\d{1,2})月(\d{1,2})日"
-    r"\s*(?:[（(][月火水木金土日祝][）)])?\s*(?:\d{1,2}時\d{0,2}分?)?\s*"
+    r"\s*(?:[（(][月火水木金土日祝][）)])?\s*(?:\d{1,2}(?:時\d{0,2}分?|[:：]\d{2}))?\s*"
     r"[〜～~]\s*(?:(20\d\d)年)?(\d{1,2})月(\d{1,2})日"
 )
 _POKECEN_APPLY_WORDS = ("応募", "受付", "申込", "申し込み", "抽選期間", "エントリー")
@@ -1492,276 +1542,309 @@ def _pokecen_lottery_candidate(title, text, today):
     }
 
 
-def _process_item(item, prev, new_state, alerts, health, candidates=None):
-    """1監視項目の判定・状態更新・通知起票。run_once から項目ごとに例外隔離されて呼ばれる。"""
+# ポケセン記事: 1パスで本文を取得する新着記事の上限と、取得失敗の再試行上限
+POKECEN_ARTICLES_PER_PASS = 5
+POKECEN_FETCH_MAX_RETRY = 5
+
+
+def _hold_prev(prev, new_state, key):
+    """取得失敗時の共通処理: 前回値があれば維持し、無ければキー未設定のまま（次回も初回扱い）。
+    `new_state[key] = prev.get(key, [])` のように既定値を書くと、cache miss 直後の失敗が
+    「空の基準」として保存され、次パスで全件が新着として偽通知される
+    （2026-09-09 監査 H1: pokecen/pokecard/在庫bool の3経路で再現）。"""
+    if key in prev:
+        new_state[key] = prev[key]
+
+
+def _mark_fail(health, item, msg):
+    health["fail"].append((item["name"], item.get("url", "")))
+    print(f"  {item['name']}: {msg}")
+
+
+def _process_pokecen_news(item, prev, new_state, alerts, health, candidates):
+    """ポケセンオンラインの記事ID差分で新着ニュースを検知する。
+    経緯(2026-08-19): 抽選応募一覧(/lottery/apply.html)はVueテンプレートで
+    中身がJSレンダリングのため、抽選が載っても静的HTMLは変化せず検知できなかった。
+    一方ニュース一覧(/news/)は単体では500を返すが、TOPページには記事IDリンクが
+    静的HTMLで並び、個別記事(/news/?id=YYYYMMDD)は静的に全文取得できる。
+    → TOPページから記事IDを拾い、新規IDの本文を取得して判定する。
+    実際 8/3 の記事(id=20260803)に抽選日程(8/10〜8/14)が載っていたが取りこぼした。"""
     key = item["key"]
-
-    if item.get("method") == "pokecen_news_ids":
-        # ポケセンオンラインの記事ID差分で新着ニュースを検知する。
-        # 経緯(2026-08-19): 抽選応募一覧(/lottery/apply.html)はVueテンプレートで
-        # 中身がJSレンダリングのため、抽選が載っても静的HTMLは変化せず検知できなかった。
-        # 一方ニュース一覧(/news/)は単体では500を返すが、TOPページには記事IDリンクが
-        # 静的HTMLで並び、個別記事(/news/?id=YYYYMMDD)は静的に全文取得できる。
-        # → TOPページから記事IDを拾い、新規IDの本文を取得して判定する。
-        # 実際 8/3 の記事(id=20260803)に抽選日程(8/10〜8/14)が載っていたが取りこぼした。
+    try:
+        resp = http_get(item["url"], allow_redirects=True)
+        html = resp.content.decode("utf-8", errors="replace")
+    except Exception as e:
+        _hold_prev(prev, new_state, key)
+        _mark_fail(health, item, f"判定不能（前回状態を維持）: {e}")
+        return
+    ids = sorted(set(re.findall(r"news/\?id=(\d{8})", html)), reverse=True)
+    if not ids:
+        _hold_prev(prev, new_state, key)
+        _mark_fail(health, item, "記事IDを抽出できず（前回状態を維持）")
+        return
+    health["ok"].append(item["name"])
+    prev_ids = prev.get(key)
+    if not isinstance(prev_ids, list):
+        new_state[key] = ids[:60]
+        print(f"  {item['name']}: 初回・{len(ids)}件を記録（通知なし）")
+        return
+    fresh = [i for i in ids if i not in set(prev_ids)]
+    if not fresh:
+        new_state[key] = ids[:60]
+        print(f"  {item['name']}: 新着なし（既知{len(ids)}件）")
+        return
+    require = item.get("require_keywords")
+    details = []
+    # 本文取得に失敗した記事は「既知」にせず次回に再試行する。
+    # ここを既知化すると、一時的な403/タイムアウトだけで記事が永久に埋もれる
+    # （まさに8/3の抽選告知を取りこぼしたのと同じ形の事故になる）。
+    # ただし恒久404の記事が枠を占有し続けないよう、再試行回数に上限を持たせる。
+    fail_counts = dict(prev.get("pokecen_fetch_fail") or {})
+    retry_later = list(fresh[POKECEN_ARTICLES_PER_PASS:])  # 枠外も未検査のまま既知化しない
+    for nid in fresh[: POKECEN_ARTICLES_PER_PASS]:
+        url = f"https://www.pokemoncenter-online.com/news/?id={nid}"
         try:
-            resp = http_get(item["url"], allow_redirects=True)
-            html = resp.content.decode("utf-8", errors="replace")
+            body = http_get(url, allow_redirects=True).content.decode("utf-8", errors="replace")
         except Exception as e:
-            new_state[key] = prev.get(key, [])
-            health["fail"].append((item["name"], item.get("url", "")))
-            print(f"  {item['name']}: 判定不能（前回状態を維持）: {e}")
-            return
-        ids = sorted(set(re.findall(r"news/\?id=(\d{8})", html)), reverse=True)
-        if not ids:
-            new_state[key] = prev.get(key, [])
-            health["fail"].append((item["name"], item.get("url", "")))
-            print(f"  {item['name']}: 記事IDを抽出できず（前回状態を維持）")
-            return
-        health["ok"].append(item["name"])
-        prev_ids = prev.get(key)
-        if not isinstance(prev_ids, list):
-            new_state[key] = ids[:60]
-            print(f"  {item['name']}: 初回・{len(ids)}件を記録（通知なし）")
-            return
-        fresh = [i for i in ids if i not in set(prev_ids)]
-        if not fresh:
-            new_state[key] = ids[:60]
-            print(f"  {item['name']}: 新着なし（既知{len(ids)}件）")
-            return
-        require = item.get("require_keywords")
-        details = []
-        # 本文取得に失敗した記事は「既知」にせず次回に再試行する。
-        # ここを既知化すると、一時的な403/タイムアウトだけで記事が永久に埋もれる
-        # （まさに8/3の抽選告知を取りこぼしたのと同じ形の事故になる）。
-        retry_later = []
-        for nid in fresh[:5]:
-            url = f"https://www.pokemoncenter-online.com/news/?id={nid}"
-            try:
-                body = http_get(url, allow_redirects=True).content.decode("utf-8", errors="replace")
-            except Exception as e:
-                print(f"    ⚠ 記事{nid}の本文取得に失敗（次回再試行）: {e}")
+            fail_counts[nid] = fail_counts.get(nid, 0) + 1
+            if fail_counts[nid] >= POKECEN_FETCH_MAX_RETRY:
+                print(f"    ⚠ 記事{nid}の本文取得に{fail_counts[nid]}回失敗（諦めて既知化）: {e}")
+                _log_suppression(prev, new_state, item["name"], f"記事{nid}", "本文取得の再試行上限")
+            else:
+                print(f"    ⚠ 記事{nid}の本文取得に失敗（次回再試行 {fail_counts[nid]}回目）: {e}")
                 retry_later.append(nid)
+            continue
+        finally:
+            time.sleep(config.REQUEST_INTERVAL)
+        fail_counts.pop(nid, None)
+        title, text = _pokecen_article_summary(body)
+        if require and not any(k in f"{title or ''} {text}" for k in require):
+            _log_suppression(prev, new_state, item["name"],
+                             title or f"記事{nid}", "対象キーワードなし")
+            continue
+        date_str = (f"{nid[:4]}/{nid[4:6]}/{nid[6:8]}"
+                    if len(nid) == 8 and nid.isdigit() else nid)
+        head = f"■ {title or f'記事{nid}'}（{date_str}掲載）"
+        # 本文は記事内の改行構造を保ち、2スペース字下げでヘッダ行と区別する
+        snippet = _snippet_lines(text, 500)
+        indented = "\n".join("  " + l for l in snippet.splitlines())
+        details.append(f"{head}\n{indented}\n{url}")
+        # 台帳連携: 抽選の応募期間が本文から確定できたら応募台帳へ構造化して渡す。
+        # 2026-09-04 の第3回追加抽選（9/11〜9/16）はこの記事で検知・通知できていたのに
+        # 台帳に載らず、リマインドが出なかった（台帳側のLLM抽出が死んでいた）。
+        # 公式一次情報からの直接登録で、台帳側の記事抽出に依存しない経路を作る。
+        if candidates is not None:
+            _today = datetime.now(ZoneInfo("Asia/Tokyo")).date()
+            c = _pokecen_lottery_candidate(title or "", text, _today)
+            if c:
+                c["source_url"] = url
+                c["detected_at"] = _today.isoformat()
+                candidates.append(c)
+                print(f"    台帳候補: {c['product'][:40]} 〆{c['apply_end']}")
+    # 取得できなかったIDは既知リストから除外して次回また fresh に載せる
+    new_state[key] = [i for i in ids[:60] if i not in set(retry_later)]
+    if fail_counts:
+        new_state["pokecen_fetch_fail"] = {k: v for k, v in fail_counts.items() if k in set(ids)}
+    if not details:
+        health["suppressed"] = health.get("suppressed", 0) + 1
+        print(f"  {item['name']}: 新着{len(fresh)}件（対象キーワードなし・通知抑制）")
+        return
+    print(f"  {item['name']}: 新着{len(details)}件検知🔔 ← 通知")
+    # 先頭に改行を置き、メールで商品名の行と記事詳細を分ける
+    alerts.append((item, "\n" + "\n\n".join(details), "info"))
+
+
+def _process_pokecard_official(item, prev, new_state, alerts, health, candidates):
+    """ポケカ公式API: (title,releaseDate)セット差分で新商品を検知（初回は基準記録）。"""
+    key = item["key"]
+    products, ok = fetch_pokecard_new_products()
+    if not ok:
+        _hold_prev(prev, new_state, key)
+        _mark_fail(health, item, "判定不能（前回状態を維持）")
+        return
+    health["ok"].append(item["name"])
+    cur_keys = sorted(products.keys())
+    new_state[key] = cur_keys
+    # 発売カレンダー用に価格・リンクを含む生データを同一実行内で渡す。
+    # state には保存しない（"_" 始まりは実行中のみ有効な一時値）。
+    new_state["_pokecard_raw"] = products
+    prev_keys = prev.get(key, None)
+    if prev_keys is None:
+        print(f"  {item['name']}: 初回・{len(cur_keys)}商品を記録（通知なし）")
+        return
+    fresh = _pokecard_fresh_keys(products, cur_keys, prev_keys)
+    if fresh:
+        names = "、".join(products[k]["title"] for k in fresh[:5])
+        print(f"  {item['name']}: 新商品{len(fresh)}件検知🔔 ← 通知（{names}）")
+        detail_lines = _pokecard_detail_lines([products[k] for k in fresh[:5]])
+        alerts.append((item, "\n" + "\n\n".join(detail_lines), "info"))
+    else:
+        print(f"  {item['name']}: 新商品なし（{len(cur_keys)}商品）")
+
+
+def _process_onepiece_news(item, prev, new_state, alerts, health, candidates):
+    """ワンピ公式ニュース: 新着記事の差分で通知（初回は基準記録）。"""
+    key = item["key"]
+    articles, ok = fetch_onepiece_news()
+    time.sleep(config.REQUEST_INTERVAL)
+    if not ok:
+        _hold_prev(prev, new_state, key)
+        _mark_fail(health, item, "判定不能（前回状態を維持）")
+        return
+    health["ok"].append(item["name"])
+    cur_keys = sorted(articles.keys())
+    new_state[key] = cur_keys
+    prev_keys = prev.get(key, None)
+    if prev_keys is None:
+        print(f"  {item['name']}: 初回・{len(cur_keys)}記事を記録（通知なし）")
+        return
+
+    def _news_wanted(k):
+        a = articles[k]
+        if any(kw in a["title"] for kw in config.SUPPLY_NOISE_KEYWORDS):
+            return False
+        if any(kw in a["title"] for kw in config.ONEPIECE_NEWS_EVENT_NOISE):
+            return False  # 大会・体験会等の遊ぶ側イベントは購入機会でない
+        if a["category"] in config.ONEPIECE_NEWS_ALWAYS_CATEGORIES:
+            return True  # 商品情報は常に通知
+        # イベント等のカテゴリは題名にコラボ/抽選等を含む場合のみ
+        return any(kw in a["title"] for kw in config.ONEPIECE_NEWS_TITLE_KEYWORDS)
+
+    fresh = [k for k in cur_keys if k not in set(prev_keys) and _news_wanted(k)]
+    if fresh:
+        names = "、".join(articles[k]["title"][:26] for k in fresh[:5])
+        print(f"  {item['name']}: 新着{len(fresh)}件検知🔔 ← 通知（{names}）")
+        detail_lines = [
+            f"■ 【{articles[k]['category']}】{articles[k]['title']}（{articles[k]['date'][:10]}）"
+            for k in fresh[:5]
+        ]
+        # 1告知=1ブロック（「 ／ 」1行連結はメールで壁になる。2026-08-21統一）
+        alerts.append((item, "\n" + "\n\n".join(detail_lines), "info"))
+    else:
+        print(f"  {item['name']}: 新着なし（{len(cur_keys)}記事）")
+
+
+def _process_page_update(item, prev, new_state, alerts, health, candidates):
+    """告知ページ: 前回ハッシュと変化したら通知（初回は基準値を保存のみ）。"""
+    key = item["key"]
+    sig, lines, ok, html = compute_page_signature(item)
+    time.sleep(config.REQUEST_INTERVAL)
+    first_seen = key not in prev  # 初回判定はキー存在で統一(H4)
+    if not ok:
+        _hold_prev(prev, new_state, key)
+        _mark_fail(health, item, "判定不能（前回状態を維持）")
+        return
+    health["ok"].append(item["name"])
+    # 状態は {"sig", "lines", "links"}。旧形式からも読めるようにする。
+    # links は「実質情報の行 → 近傍のストアURL」の対応（ダイジェスト表示にも使う）。
+    prev_val = prev.get(key)
+    prev_sig = prev_val.get("sig") if isinstance(prev_val, dict) else prev_val
+    prev_lines = prev_val.get("lines") if isinstance(prev_val, dict) else None
+    today_jst = datetime.now(ZoneInfo("Asia/Tokyo")).date()
+    anchors = extract_anchors(html)  # 行→リンク照合用（ページごとに1回だけ抽出）
+    strict = bool(item.get("strict_actions"))
+    is_pokeca = ("ポケカ" in item["name"]) or ("ポケモン" in item["name"]) or ("pokemon" in item.get("url", ""))
+    expired = _expired_pokeca_titles(prev, new_state, today_jst)
+    require = item.get("require_keywords")
+
+    def _notable(l):
+        return (_is_actionable_line(l, today_jst, strict, is_pokeca)
+                and passes_require_keywords(l, require)
+                and not _mentions_expired(l, expired))
+
+    links = {}
+    for l in lines:
+        if _notable(l):
+            url = resolve_store_link(html, l, anchors)
+            if url:
+                links[l] = url
+    new_state[key] = {"sig": sig, "lines": lines, "links": links}
+    if first_seen:
+        print(f"  {item['name']}: 初回・基準を記録（通知なし）")
+        return
+    if sig == prev_sig:
+        print(f"  {item['name']}: 更新なし")
+        return
+    added = []
+    if isinstance(prev_lines, list):
+        prev_set = set(prev_lines)
+        added = [l for l in lines if l not in prev_set]
+    # 「実質的な情報の行」だけに絞る。定型文の変化や行の削除だけの更新は
+    # 通知しない（=通知が来たら本物、の精度を守る）。
+    actionable = [l for l in added if _notable(l)]
+    for l in [x for x in added if x not in set(actionable)][:5]:
+        _log_suppression(prev, new_state, item["name"], l, "実質情報フィルタ")
+    if not actionable:
+        health["suppressed"] = health.get("suppressed", 0) + 1
+        print(f"  {item['name']}: 更新あり（実質情報なし・通知抑制。新規{len(added)}行）")
+        return
+    # 台帳連携: 店舗・締切が確定した抽選は構造化して応募台帳へ渡す（案A/B）
+    if candidates is not None:
+        for l in actionable:
+            c = extract_lottery_candidate(l, item, today_jst, config.STORE_NAME_HINTS)
+            if c:
+                c["source_url"] = links.get(l) or item.get("url", "")
+                c["detected_at"] = today_jst.isoformat()
+                candidates.append(c)
+    # nyuka-now集約ページは「過去の販売・再販履歴のログ」で、履歴行は検知時点で
+    # ほぼ完売している（2026-08-26 実害: アニメイトFB10再販を通知→購入不可）。
+    # 履歴行（開始済みイベント）は直リンク先に品切れ表示がないことを確認できた
+    # 場合だけ通知し、確認手段がない（検索URLしかない）行は通知しない。
+    # 抽選・予約・受付など「これから行動できる」行は従来どおり通知する。
+    if _is_history_log_page(item):
+        passed = []
+        for l in actionable:
+            if contains_any(l, OPEN_ACTION_KEYWORDS):
+                passed.append(l)
                 continue
-            title, text = _pokecen_article_summary(body)
-            if require and not any(k in f"{title or ''} {text}" for k in require):
-                _log_suppression(prev, new_state, item["name"],
-                                 title or f"記事{nid}", "対象キーワードなし")
+            link = links.get(l)
+            if not link:
+                print(f"    抑制（事後ログ・確認先なし）: {l[:50]}")
+                _log_suppression(prev, new_state, item["name"], l, "事後ログ・確認先なし")
                 continue
-            date_str = (f"{nid[:4]}/{nid[4:6]}/{nid[6:8]}"
-                        if len(nid) == 8 and nid.isdigit() else nid)
-            head = f"■ {title or f'記事{nid}'}（{date_str}掲載）"
-            # 本文は記事内の改行構造を保ち、2スペース字下げでヘッダ行と区別する
-            snippet = _snippet_lines(text, 500)
-            indented = "\n".join("  " + l for l in snippet.splitlines())
-            details.append(f"{head}\n{indented}\n{url}")
-            # 台帳連携: 抽選の応募期間が本文から確定できたら応募台帳へ構造化して渡す。
-            # 2026-09-04 の第3回追加抽選（9/11〜9/16）はこの記事で検知・通知できていたのに
-            # 台帳に載らず、リマインドが出なかった（台帳側のLLM抽出が死んでいた）。
-            # 公式一次情報からの直接登録で、台帳側の記事抽出に依存しない経路を作る。
-            if candidates is not None:
-                _today = datetime.now(ZoneInfo("Asia/Tokyo")).date()
-                c = _pokecen_lottery_candidate(title or "", text, _today)
-                if c:
-                    c["source_url"] = url
-                    c["detected_at"] = _today.isoformat()
-                    candidates.append(c)
-                    print(f"    台帳候補: {c['product'][:40]} 〆{c['apply_end']}")
-        # 取得できなかったIDは既知リストから除外して次回また fresh に載せる
-        new_state[key] = [i for i in ids[:60] if i not in set(retry_later)]
-        if not details:
-            health["suppressed"] = health.get("suppressed", 0) + 1
-            print(f"  {item['name']}: 新着{len(fresh)}件（対象キーワードなし・通知抑制）")
+            if _quick_stock_check(link) is False:
+                print(f"    抑制（リンク先が品切れ表示）: {l[:50]}")
+                _log_suppression(prev, new_state, item["name"], l, "リンク先が品切れ表示")
+                continue
+            passed.append(l)
+        if len(passed) < len(actionable):
+            health["suppressed"] = health.get("suppressed", 0) + (len(actionable) - len(passed))
+        actionable = passed
+        if not actionable:
+            print(f"  {item['name']}: 更新あり（完売済み履歴のみ・通知抑制）")
             return
-        print(f"  {item['name']}: 新着{len(details)}件検知🔔 ← 通知")
-        # 先頭に改行を置き、メールで商品名の行と記事詳細を分ける
-        alerts.append((item, "\n" + "\n\n".join(details), "info"))
-        return
+    # 1告知=「■見出し行＋URL行」のブロック。全告知を「 ／ 」で1行に繋ぐと
+    # メールが読めない壁になる（2026-08-21 実害）。改行はbuild_messagesが
+    # HTMLでは<br>に変換する
+    shown = []
+    for l in actionable[: config.DIFF_LINES_SHOWN]:
+        entry = f"■ {l[: config.DIFF_LINE_MAXLEN]}"
+        if links.get(l):
+            entry += f"\n  {links[l]}"  # 確実な直リンク
+        elif not item.get("no_search_fallback"):
+            # 直リンクが確実に取れない場合はストア検索URL（商品名入り）を付ける。
+            # 集約ページのURLだけでは行動につながらないため。
+            # 公式info一覧のような「お知らせ」ページでは Amazon検索が無意味なので
+            # no_search_fallback で抑止し、末尾の監視元URL（一覧）に任せる。
+            search = fallback_search_url(l, item)
+            if search:
+                entry += f"\n  検索: {search}"
+        shown.append(entry)
+    more = (f"\n\n…ほか{len(actionable) - len(shown)}行"
+            if len(actionable) > len(shown) else "")
+    detail = f"\n（新規{len(actionable)}行）\n" + "\n\n".join(shown) + more
+    print(f"  {item['name']}: 告知更新を検知🔔 ← 通知（実質{len(actionable)}行/新規{len(added)}行）")
+    alerts.append((item, detail, "info"))
 
-    if item.get("method") == "pokecard_official_list":
-        # ポケカ公式API: (title,releaseDate)セット差分で新商品を検知（初回は基準記録）
-        products, ok = fetch_pokecard_new_products()
-        if not ok:
-            new_state[key] = prev.get(key, [])
-            health["fail"].append((item["name"], item.get("url", "")))
-            print(f"  {item['name']}: 判定不能（前回状態を維持）")
-            return
-        health["ok"].append(item["name"])
-        cur_keys = sorted(products.keys())
-        new_state[key] = cur_keys
-        # 発売カレンダー用に価格・リンクを含む生データを同一実行内で渡す。
-        # state には保存しない（"_" 始まりは実行中のみ有効な一時値）。
-        new_state["_pokecard_raw"] = products
-        prev_keys = prev.get(key, None)
-        if prev_keys is None:
-            print(f"  {item['name']}: 初回・{len(cur_keys)}商品を記録（通知なし）")
-        else:
-            fresh = _pokecard_fresh_keys(products, cur_keys, prev_keys)
-            if fresh:
-                names = "、".join(products[k]["title"] for k in fresh[:5])
-                print(f"  {item['name']}: 新商品{len(fresh)}件検知🔔 ← 通知（{names}）")
-                detail_lines = _pokecard_detail_lines([products[k] for k in fresh[:5]])
-                alerts.append((item, "\n" + "\n\n".join(detail_lines), "info"))
-            else:
-                print(f"  {item['name']}: 新商品なし（{len(cur_keys)}商品）")
-        return
 
-    if item.get("method") == "onepiece_news":
-        # ワンピ公式ニュース: 新着記事の差分で通知（初回は基準記録）
-        articles, ok = fetch_onepiece_news()
-        time.sleep(config.REQUEST_INTERVAL)
-        if not ok:
-            new_state[key] = prev.get(key, [])
-            health["fail"].append((item["name"], item.get("url", "")))
-            print(f"  {item['name']}: 判定不能（前回状態を維持）")
-            return
-        health["ok"].append(item["name"])
-        cur_keys = sorted(articles.keys())
-        new_state[key] = cur_keys
-        prev_keys = prev.get(key, None)
-        if prev_keys is None:
-            print(f"  {item['name']}: 初回・{len(cur_keys)}記事を記録（通知なし）")
-        else:
-            def _news_wanted(k):
-                a = articles[k]
-                if any(kw in a["title"] for kw in config.SUPPLY_NOISE_KEYWORDS):
-                    return False
-                if any(kw in a["title"] for kw in config.ONEPIECE_NEWS_EVENT_NOISE):
-                    return False  # 大会・体験会等の遊ぶ側イベントは購入機会でない
-                if a["category"] in config.ONEPIECE_NEWS_ALWAYS_CATEGORIES:
-                    return True  # 商品情報は常に通知
-                # イベント等のカテゴリは題名にコラボ/抽選等を含む場合のみ
-                return any(kw in a["title"] for kw in config.ONEPIECE_NEWS_TITLE_KEYWORDS)
-            fresh = [k for k in cur_keys if k not in set(prev_keys) and _news_wanted(k)]
-            if fresh:
-                names = "、".join(articles[k]["title"][:26] for k in fresh[:5])
-                print(f"  {item['name']}: 新着{len(fresh)}件検知🔔 ← 通知（{names}）")
-                detail_lines = [
-                    f"【{articles[k]['category']}】{articles[k]['title']}（{articles[k]['date'][:10]}）"
-                    for k in fresh[:5]
-                ]
-                alerts.append((item, "ワンピ公式ニュース: " + " ／ ".join(detail_lines), "info"))
-            else:
-                print(f"  {item['name']}: 新着なし（{len(cur_keys)}記事）")
-        return
-
-    if item.get("method") == "page_update":
-        # 告知ページ: 前回ハッシュと変化したら通知（初回は基準値を保存のみ）
-        sig, lines, ok, html = compute_page_signature(item)
-        time.sleep(config.REQUEST_INTERVAL)
-        first_seen = key not in prev  # 初回判定はキー存在で統一(H4)
-        if not ok:
-            # 取得失敗: 前回値があれば維持、無ければキー未設定のまま(次回も初回扱い)
-            if key in prev:
-                new_state[key] = prev[key]
-            health["fail"].append((item["name"], item.get("url", "")))
-            print(f"  {item['name']}: 判定不能（前回状態を維持）")
-            return
-        health["ok"].append(item["name"])
-        # 状態は {"sig", "lines", "links"}。旧形式からも読めるようにする。
-        # links は「実質情報の行 → 近傍のストアURL」の対応（ダイジェスト表示にも使う）。
-        prev_val = prev.get(key)
-        prev_sig = prev_val.get("sig") if isinstance(prev_val, dict) else prev_val
-        prev_lines = prev_val.get("lines") if isinstance(prev_val, dict) else None
-        today_jst = datetime.now(ZoneInfo("Asia/Tokyo")).date()
-        anchors = extract_anchors(html)  # 行→リンク照合用（ページごとに1回だけ抽出）
-        strict = bool(item.get("strict_actions"))
-        is_pokeca = ("ポケカ" in item["name"]) or ("ポケモン" in item["name"]) or ("pokemon" in item.get("url", ""))
-        expired = _expired_pokeca_titles(prev, new_state, today_jst)
-        require = item.get("require_keywords")
-        def _notable(l):
-            return (_is_actionable_line(l, today_jst, strict, is_pokeca)
-                    and passes_require_keywords(l, require)
-                    and not _mentions_expired(l, expired))
-        links = {}
-        for l in lines:
-            if _notable(l):
-                url = resolve_store_link(html, l, anchors)
-                if url:
-                    links[l] = url
-        new_state[key] = {"sig": sig, "lines": lines, "links": links}
-        if first_seen:
-            print(f"  {item['name']}: 初回・基準を記録（通知なし）")
-        elif sig != prev_sig:
-            added = []
-            if isinstance(prev_lines, list):
-                prev_set = set(prev_lines)
-                added = [l for l in lines if l not in prev_set]
-            # 「実質的な情報の行」だけに絞る。定型文の変化や行の削除だけの更新は
-            # 通知しない（=通知が来たら本物、の精度を守る）。
-            actionable = [l for l in added if _notable(l)]
-            for l in [x for x in added if x not in set(actionable)][:5]:
-                _log_suppression(prev, new_state, item["name"], l, "実質情報フィルタ")
-            if not actionable:
-                health["suppressed"] = health.get("suppressed", 0) + 1
-                print(f"  {item['name']}: 更新あり（実質情報なし・通知抑制。新規{len(added)}行）")
-                return
-            # 台帳連携: 店舗・締切が確定した抽選は構造化して応募台帳へ渡す（案A/B）
-            if candidates is not None:
-                for l in actionable:
-                    c = extract_lottery_candidate(l, item, today_jst, config.STORE_NAME_HINTS)
-                    if c:
-                        c["source_url"] = links.get(l) or item.get("url", "")
-                        c["detected_at"] = today_jst.isoformat()
-                        candidates.append(c)
-            # nyuka-now集約ページは「過去の販売・再販履歴のログ」で、履歴行は検知時点で
-            # ほぼ完売している（2026-08-26 実害: アニメイトFB10再販を通知→購入不可）。
-            # 履歴行（開始済みイベント）は直リンク先に品切れ表示がないことを確認できた
-            # 場合だけ通知し、確認手段がない（検索URLしかない）行は通知しない。
-            # 抽選・予約・受付など「これから行動できる」行は従来どおり通知する。
-            if _is_history_log_page(item):
-                passed = []
-                for l in actionable:
-                    if contains_any(l, OPEN_ACTION_KEYWORDS):
-                        passed.append(l)
-                        continue
-                    link = links.get(l)
-                    if not link:
-                        print(f"    抑制（事後ログ・確認先なし）: {l[:50]}")
-                        _log_suppression(prev, new_state, item["name"], l, "事後ログ・確認先なし")
-                        continue
-                    if _quick_stock_check(link) is False:
-                        print(f"    抑制（リンク先が品切れ表示）: {l[:50]}")
-                        _log_suppression(prev, new_state, item["name"], l, "リンク先が品切れ表示")
-                        continue
-                    passed.append(l)
-                if len(passed) < len(actionable):
-                    health["suppressed"] = health.get("suppressed", 0) + (len(actionable) - len(passed))
-                actionable = passed
-                if not actionable:
-                    print(f"  {item['name']}: 更新あり（完売済み履歴のみ・通知抑制）")
-                    return
-            # 1告知=「■見出し行＋URL行」のブロック。全告知を「 ／ 」で1行に繋ぐと
-            # メールが読めない壁になる（2026-08-21 実害）。改行はbuild_messagesが
-            # HTMLでは<br>に変換する
-            shown = []
-            for l in actionable[: config.DIFF_LINES_SHOWN]:
-                entry = f"■ {l[: config.DIFF_LINE_MAXLEN]}"
-                if links.get(l):
-                    entry += f"\n  {links[l]}"  # 確実な直リンク
-                elif not item.get("no_search_fallback"):
-                    # 直リンクが確実に取れない場合はストア検索URL（商品名入り）を付ける。
-                    # 集約ページのURLだけでは行動につながらないため。
-                    # 公式info一覧のような「お知らせ」ページでは Amazon検索が無意味なので
-                    # no_search_fallback で抑止し、末尾の監視元URL（一覧）に任せる。
-                    entry += f"\n  検索: {fallback_search_url(l, item)}"
-                shown.append(entry)
-            more = (f"\n\n…ほか{len(actionable) - len(shown)}行"
-                    if len(actionable) > len(shown) else "")
-            detail = f"\n（新規{len(actionable)}行）\n" + "\n\n".join(shown) + more
-            print(f"  {item['name']}: 告知更新を検知🔔 ← 通知（実質{len(actionable)}行/新規{len(added)}行）")
-            alerts.append((item, detail, "info"))
-        else:
-            print(f"  {item['name']}: 更新なし")
-        return
-
-    # 在庫系（gdb_soldout / toei_stock_status / rakuten_books）
+def _process_stock(item, prev, new_state, alerts, health, candidates):
+    """在庫系（toei_stock_status / rakuten_books / 旧gdb_soldout）: 在庫なし→ありの遷移で通知。"""
+    key = item["key"]
     in_stock, ok, detail = check_item(item)
     time.sleep(config.REQUEST_INTERVAL)
     if not ok:
-        new_state[key] = prev.get(key, False)  # 取得失敗は前回維持（誤通知防止）
-        health["fail"].append((item["name"], item.get("url", "")))
-        print(f"  {item['name']}: 判定不能（前回状態を維持）")
+        _hold_prev(prev, new_state, key)  # 取得失敗は前回維持（誤通知防止）
+        _mark_fail(health, item, "判定不能（前回状態を維持）")
         return
 
     health["ok"].append(item["name"])
@@ -1772,6 +1855,7 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
         # trueに張り付き、ヨドバシ等の定価店の復活を見逃す盲点があった。
         # detail は _check_gdb_soldout が生成する在庫あり店名の ", " 連結。
         # 大文字小文字の表記ゆれで「新規店舗」と誤判定しないよう小文字に正規化。
+        # （ガンプラ監視は2026-07-10に除外済み。方式は将来の再利用のため残置）
         shops = [s.lower() for s in detail.split(", ") if s] if detail else []
         prev_val = prev.get(key)
         prev_shops = prev_val.get("shops") if isinstance(prev_val, dict) else None
@@ -1811,6 +1895,22 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
     print(f"  {item['name']}: {status}{detail_note}{change}")
 
 
+# method → 処理関数。新サイトを足す場合は関数を追加してここに登録する
+# （2026-09-09 リファクタ: 400行超の単一関数を方式ごとに分割。振る舞いは不変）
+METHOD_HANDLERS = {
+    "pokecen_news_ids": _process_pokecen_news,
+    "pokecard_official_list": _process_pokecard_official,
+    "onepiece_news": _process_onepiece_news,
+    "page_update": _process_page_update,
+}
+
+
+def _process_item(item, prev, new_state, alerts, health, candidates=None):
+    """1監視項目の判定・状態更新・通知起票。run_once から項目ごとに例外隔離されて呼ばれる。"""
+    handler = METHOD_HANDLERS.get(item.get("method"), _process_stock)
+    handler(item, prev, new_state, alerts, health, candidates)
+
+
 def run_once():
     """在庫チェックを1パス実行し、在庫復活/告知更新があれば通知する。状態はファイルで永続化。"""
     _UNREACHABLE_HOSTS.clear()  # 接続不能ホストの記録はパスごとにリセット（次パスで再挑戦）
@@ -1818,6 +1918,17 @@ def run_once():
     new_state = {}
     alerts = []  # [(item, detail)] 通知すべき変化
     health = {"ok": [], "fail": [], "suppressed": 0}  # 日次ヘルス/週次サマリ用
+    if not prev:
+        # 初回、または Actions cache の消失/破損。全監視が「初回・基準を記録」に戻り、
+        # 1サイクル分の検知と現在のチャンス一覧を黙って失う（2026-09-09 監査 M5）。
+        # 再通知は起きない（安全側）が、起きたことは本人に見せる
+        alerts.append((
+            {"name": "ℹ 監視状態がリセットされました（初回実行 または キャッシュ消失）",
+             "url": "https://github.com/RyoUmeyama/arb-restock-tracker/actions",
+             "retail_price": 0},
+            "\n全監視項目が今回のパスで基準を取り直します（このパスの変化は通知されません）。"
+            "\n直近に見逃したくない抽選・予約があれば、各まとめページを一度手で確認してください。",
+            "info"))
     candidates = []  # 応募台帳へ連携する抽選候補（店舗・締切が確定したもの）
 
     # Phase2: RSS発見器で新弾・再販を自動キャッチ（固定リストを動的に補完）。
@@ -1862,7 +1973,12 @@ def run_once():
         rd = item.get("release_date")
         if rd:
             from datetime import date
-            age = (datetime.now(ZoneInfo("Asia/Tokyo")).date() - date.fromisoformat(rd)).days
+            try:
+                age = (datetime.now(ZoneInfo("Asia/Tokyo")).date() - date.fromisoformat(rd)).days
+            except ValueError:
+                # config の日付書式ミスでジョブ全体を落とさない（失効判定だけ諦める）
+                print(f"  ⚠ {item['name']}: release_date の書式が不正 ({rd!r})・失効判定をスキップ")
+                age = 0
             if age > config.MAX_PRODUCT_AGE_DAYS:
                 if key in prev:
                     new_state[key] = prev[key]
@@ -1903,11 +2019,15 @@ def run_once():
     # 日次ヘルスレポート（JST9時以降の最初のパスで1通・生存確認）
     append_heartbeat(prev, new_state, alerts, health)
 
-    save_state(new_state)
-
+    # 通知が届いてから状態を確定させる。先に保存すると、SMTP一時障害等で通知に失敗した
+    # 検知が「既知」になり二度と再通知されない（2026-09-09 監査 H2）。
+    # 失敗時は保存せず次パスで再検知→再通知させる（ループの残りパスも止めない）。
     if alerts:
         print(f"  🎉 通知すべき変化 {len(alerts)}件 → 通知")
-        notify(alerts)
+        if not notify(alerts):
+            print("  ⚠ 通知に失敗したため状態を保存しない（次パスで再検知・再通知）")
+            return len(alerts)
+    save_state(new_state)
     return len(alerts)
 
 
@@ -2016,7 +2136,11 @@ def build_messages(alerts):
     # X投稿用のコピペブロックを末尾に追加（プレーンテキスト側とWebhookのみ。
     # HTMLメールからのコピーは書式が混ざるため載せない）。
     # AMAZON_ASSOCIATE_TAG を設定するとAmazonリンクにタグが付き、#PRが自動で入る。
-    x_block = build_post_block(norm, affiliate_tag=os.environ.get("AMAZON_ASSOCIATE_TAG"))
+    # 対象は在庫検知（stock）だけ。ヘルスレポートや告知更新（info）にまで投稿文が付くと
+    # 「📊 日次ヘルスレポート／再販告知／…#再販情報」のような無意味な投稿文が生成される
+    # （2026-09-09 監査 M6）
+    x_block = build_post_block([a for a in norm if a[2] == "stock"],
+                               affiliate_tag=os.environ.get("AMAZON_ASSOCIATE_TAG"))
     text_lines.extend(x_block)
     web_lines.extend(x_block)
 
@@ -2032,12 +2156,15 @@ def build_messages(alerts):
 
 
 def notify(restocked):
+    """通知を送る。メール・Webhook のどちらかが届けば True。両方失敗なら False
+    （呼び出し側が状態保存を見送り、次パスで再通知する）。"""
     subject, text, html, web_title, web_lines = build_messages(restocked)
     mail_ok = _notify_email(subject, text, html)
     hook_ok = _notify_webhook(web_title, web_lines)
     if not mail_ok and not hook_ok:
         print("✗ メール・Webhookとも通知できませんでした")
-        sys.exit(1)
+        return False
+    return True
 
 
 def _notify_email(subject, text, html):
