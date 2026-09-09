@@ -827,7 +827,7 @@ class TestRequireKeywords(unittest.TestCase):
     def test_tokyo_stores_only(self):
         """実店舗の監視は東京都内のみ（ユーザー方針 2026-07-30）。"""
         import config
-        clabo = [i for i in config.WATCH_ITEMS if i["key"].startswith("clabo_")]
+        clabo = [i for i in cs.config.WATCH_ITEMS if i["key"].startswith("clabo_")]
         self.assertEqual(len(clabo), 4)
         for it in clabo:
             self.assertTrue(it.get("strict_actions"))
@@ -1403,3 +1403,73 @@ class TestSuppressionAudit(unittest.TestCase):
             self.assertNotIn("古い抑制", hb[1], "24hより古い抑制は載せない")
         finally:
             cs.datetime = orig
+
+
+class TestPokecenLotteryCandidate(unittest.TestCase):
+    """2026-09-09: ポケセン公式記事から応募台帳へ抽選を直接渡す（第3回追加抽選の取りこぼし対策）"""
+    TITLE = "ポケモンカードゲーム30周年記念商品の追加抽選販売について"
+    TEXT = ("MEGA 拡張パック「30th CELEBRATION」BOX ほかの追加抽選販売を実施いたします。\n"
+            "発売日 2026年9月16日（水）\n"
+            "応募受付期間 2026年9月11日（金）16時00分～9月16日（水）16時59分\n"
+            "当選発表 9月30日（水）13時00分以降\n"
+            "注文期間 9月30日（水）13時00分～10月6日（火）16時59分")
+
+    def test_round3_article_yields_apply_period(self):
+        from datetime import date
+        c = cs._pokecen_lottery_candidate(self.TITLE, self.TEXT, date(2026, 9, 4))
+        self.assertIsNotNone(c)
+        self.assertEqual(c["channel"], "ポケモンセンターオンライン")
+        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-09-11", "2026-09-16"))
+        self.assertEqual(c["product"], self.TITLE)
+
+    def test_order_period_is_not_mistaken_for_apply_period(self):
+        from datetime import date
+        text = "追加抽選の当選発表 9月30日（水）13時以降\n注文期間 9月30日（水）13時00分～10月6日（火）16時59分"
+        self.assertIsNone(cs._pokecen_lottery_candidate("追加抽選のお知らせ", text, date(2026, 9, 4)),
+                          "応募/受付の語がない期間（注文期間）は応募期間とみなさない")
+
+    def test_non_lottery_article_ignored(self):
+        from datetime import date
+        self.assertIsNone(cs._pokecen_lottery_candidate(
+            "配送遅延のお知らせ", "応募受付 9月1日〜9月5日", date(2026, 9, 4)))
+
+    def test_past_period_ignored(self):
+        from datetime import date
+        self.assertIsNone(cs._pokecen_lottery_candidate(self.TITLE, self.TEXT, date(2026, 9, 20)))
+
+
+class TestPokecardDetailLines(unittest.TestCase):
+    """2026-09-09 実害: APIの link_detailPage が全件空で「■見出し＋空行」が並ぶ崩れたメール"""
+
+    def test_empty_link_produces_no_blank_line(self):
+        lines = cs._pokecard_detail_lines([
+            {"title": "カードホルダー ピカチュウ", "releaseDate": "2026年 9月16日（水）", "price": "800円（税込）", "link": ""}])
+        self.assertEqual(lines, ["■ カードホルダー ピカチュウ（2026年 9月16日（水） 800円（税込））"])
+        self.assertNotIn("\n", lines[0])
+
+    def test_relative_link_gets_official_domain(self):
+        lines = cs._pokecard_detail_lines([
+            {"title": "X", "releaseDate": "d", "price": "p", "link": "/products/x.html"}])
+        self.assertTrue(lines[0].endswith("\n  https://www.pokemon-card.com/products/x.html"))
+
+    def test_display_url_is_not_the_api_endpoint(self):
+        item = next(i for i in cs.config.WATCH_ITEMS if i.get("key") == "pokecard_official")
+        self.assertNotIn("resultAPI", item["url"])
+
+
+class TestOfficialInfoNoSearchFallback(unittest.TestCase):
+    """2026-09-09 実害: 公式infoの「使用についてのお知らせ」にAmazon検索URLが付いた"""
+
+    def test_pokecard_info_has_no_search_fallback(self):
+        item = next(i for i in cs.config.WATCH_ITEMS if i.get("key") == "pokecard_info")
+        self.assertTrue(item.get("no_search_fallback"))
+
+    def test_usage_notice_is_not_actionable(self):
+        from datetime import date
+        line = "「プロモカードパック 25th ANNIVERSARY edition」の使用についてのお知らせ"
+        self.assertFalse(cs._is_actionable_line(line, date(2026, 9, 9), False, True))
+
+    def test_release_notice_still_actionable(self):
+        from datetime import date
+        line = "9月16日（水）に発売のポケモンカードゲーム周辺グッズを一挙紹介！"
+        self.assertTrue(cs._is_actionable_line(line, date(2026, 9, 9), False, True))

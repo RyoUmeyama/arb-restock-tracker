@@ -976,7 +976,7 @@ def extract_opportunities(prev, new_state, today):
             entry = f"[{short}] {text[:90]}"
             if links.get(line):
                 entry += f" →{links[line]}"  # 確実な直リンク
-            else:
+            elif not item.get("no_search_fallback"):
                 entry += f" →検索:{fallback_search_url(line, item)}"
             out.append(entry)
             if len(out) >= config.DIGEST_MAX_LINES:
@@ -1417,6 +1417,68 @@ def _snippet_lines(text, budget):
     return "\n".join(out)
 
 
+def _pokecard_detail_lines(products):
+    """ポケカ公式API 新商品通知の本文ブロック。
+    APIの link_detailPage は空のことが多く（2026-09-09 実害: 5商品すべて空で
+    「■見出し＋空行」が並ぶ崩れたメールになった）、空ならリンク行を出さない。
+    相対パスなら公式ドメインを補う。"""
+    lines = []
+    for p in products:
+        head = f"■ {p.get('title', '')}（{p.get('releaseDate', '')} {p.get('price', '')}）"
+        link = (p.get("link") or "").strip()
+        if link.startswith("/"):
+            link = "https://www.pokemon-card.com" + link
+        lines.append(f"{head}\n  {link}" if link else head)
+    return lines
+
+
+_POKECEN_PERIOD_RE = re.compile(
+    r"(?:(20\d\d)年)?(\d{1,2})月(\d{1,2})日"
+    r"\s*(?:[（(][月火水木金土日祝][）)])?\s*(?:\d{1,2}時\d{0,2}分?)?\s*"
+    r"[〜～~]\s*(?:(20\d\d)年)?(\d{1,2})月(\d{1,2})日"
+)
+_POKECEN_APPLY_WORDS = ("応募", "受付", "申込", "申し込み", "抽選期間", "エントリー")
+
+
+def _pokecen_lottery_candidate(title, text, today):
+    """ポケセンオンライン公式記事から応募台帳に渡す抽選候補を作る。
+    条件（精度優先）: 「抽選」を含み、本文に「M月D日(曜)HH時MM分〜M月D日」形式の期間があり、
+    その直前40字に応募/受付系の語があること（発表日・注文期間・発売日の範囲と区別する）。
+    複数の期間があれば応募語つきの最初のものを採る。"""
+    from datetime import date as _date
+    body = f"{title}\n{text}"
+    if "抽選" not in body:
+        return None
+
+    def _resolve(y, m, d):
+        try:
+            if y:
+                return _date(int(y), int(m), int(d))
+            dt = _date(today.year, int(m), int(d))
+            return _date(today.year + 1, int(m), int(d)) if (today - dt).days > 180 else dt
+        except ValueError:
+            return None
+
+    picked = None
+    for m in _POKECEN_PERIOD_RE.finditer(body):
+        context = body[max(0, m.start() - 40):m.start()]
+        if any(w in context for w in _POKECEN_APPLY_WORDS):
+            picked = m
+            break
+    if picked is None:
+        return None
+    y1, mo1, d1, y2, mo2, d2 = picked.groups()
+    start, end = _resolve(y1 or y2, mo1, d1), _resolve(y2 or y1, mo2, d2)
+    if not start or not end or end < start or (end - today).days < 0 or (end - today).days > 90:
+        return None
+    return {
+        "channel": "ポケモンセンターオンライン",
+        "product": (title or "ポケセンオンライン抽選").strip()[:60],
+        "apply_start": start.isoformat(),
+        "apply_end": end.isoformat(),
+    }
+
+
 def _process_item(item, prev, new_state, alerts, health, candidates=None):
     """1監視項目の判定・状態更新・通知起票。run_once から項目ごとに例外隔離されて呼ばれる。"""
     key = item["key"]
@@ -1480,6 +1542,18 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
             snippet = _snippet_lines(text, 500)
             indented = "\n".join("  " + l for l in snippet.splitlines())
             details.append(f"{head}\n{indented}\n{url}")
+            # 台帳連携: 抽選の応募期間が本文から確定できたら応募台帳へ構造化して渡す。
+            # 2026-09-04 の第3回追加抽選（9/11〜9/16）はこの記事で検知・通知できていたのに
+            # 台帳に載らず、リマインドが出なかった（台帳側のLLM抽出が死んでいた）。
+            # 公式一次情報からの直接登録で、台帳側の記事抽出に依存しない経路を作る。
+            if candidates is not None:
+                _today = datetime.now(ZoneInfo("Asia/Tokyo")).date()
+                c = _pokecen_lottery_candidate(title or "", text, _today)
+                if c:
+                    c["source_url"] = url
+                    c["detected_at"] = _today.isoformat()
+                    candidates.append(c)
+                    print(f"    台帳候補: {c['product'][:40]} 〆{c['apply_end']}")
         # 取得できなかったIDは既知リストから除外して次回また fresh に載せる
         new_state[key] = [i for i in ids[:60] if i not in set(retry_later)]
         if not details:
@@ -1514,11 +1588,7 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
             if fresh:
                 names = "、".join(products[k]["title"] for k in fresh[:5])
                 print(f"  {item['name']}: 新商品{len(fresh)}件検知🔔 ← 通知（{names}）")
-                detail_lines = []
-                for k in fresh[:5]:
-                    p = products[k]
-                    detail_lines.append(
-                        f"■ {p['title']}（{p['releaseDate']} {p['price']}）\n  {p['link']}")
+                detail_lines = _pokecard_detail_lines([products[k] for k in fresh[:5]])
                 alerts.append((item, "\n" + "\n\n".join(detail_lines), "info"))
             else:
                 print(f"  {item['name']}: 新商品なし（{len(cur_keys)}商品）")
@@ -1657,9 +1727,11 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
                 entry = f"■ {l[: config.DIFF_LINE_MAXLEN]}"
                 if links.get(l):
                     entry += f"\n  {links[l]}"  # 確実な直リンク
-                else:
+                elif not item.get("no_search_fallback"):
                     # 直リンクが確実に取れない場合はストア検索URL（商品名入り）を付ける。
                     # 集約ページのURLだけでは行動につながらないため。
+                    # 公式info一覧のような「お知らせ」ページでは Amazon検索が無意味なので
+                    # no_search_fallback で抑止し、末尾の監視元URL（一覧）に任せる。
                     entry += f"\n  検索: {fallback_search_url(l, item)}"
                 shown.append(entry)
             more = (f"\n\n…ほか{len(actionable) - len(shown)}行"

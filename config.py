@@ -309,7 +309,9 @@ WATCH_ITEMS = [
     {
         "name": "ポケカ公式 新商品検知（全カテゴリ）",
         "method": "pokecard_official_list",
-        "url": "https://www.pokemon-card.com/products/resultAPI.php",
+        # 取得先APIは check_stock.fetch_pokecard_new_products に固定。ここはメール末尾に
+        # 載せる「人が開くURL」（APIのURLを載せても行動できない。2026-09-09）
+        "url": "https://www.pokemon-card.com/products/",
         "retail_price": 0,
         "key": "pokecard_official",
     },
@@ -329,6 +331,10 @@ WATCH_ITEMS = [
         "url": "https://www.pokemon-card.com/info/",
         "retail_price": 0,
         "key": "pokecard_info",
+        # 公式の「お知らせ」に Amazon検索URLを付けても意味がない（2026-09-09 実害:
+        # 「プロモカードパックの使用についてのお知らせ」に長いAmazon検索リンクが付いた）。
+        # 直リンクが取れた行だけリンクを出し、取れない行は末尾の一覧URLに任せる。
+        "no_search_fallback": True,
     },
     # --- ポケセンオンライン 抽選（30th最重要。FUTURISTIC BOXはここが唯一の入手経路）---
     # 公式(2026-07-13)が「本人認証機能を用いた抽選販売を8月から開始する予定」と明言。
@@ -641,7 +647,9 @@ DIGEST_EXCLUDE_MARKERS = ["収録カードリスト", "当たりカード", "買
                           "招待選手", "チャンピオンシップ", "ゲスト参加",
                           "先着エントリーの受付", "エントリーキャンペーン", "ポケカジム",
                           # 記事誘導
-                          "動画でチェック"]
+                          "動画でチェック",
+                          # ルール・使用可否の告知（商品入手と無関係。2026-09-09）
+                          "使用について", "使用可否", "利用規約"]
 DIGEST_LINE_MAXLEN = 90        # これより長い行は記事紹介文の可能性が高いので除外
 DIGEST_LINE_MINLEN = 8         # 短すぎる断片行（テーブルセル由来）は除外
 # 日付がなくても「今応募できる」ことを示すマーカー（Amazon招待リクエスト抽選等）
