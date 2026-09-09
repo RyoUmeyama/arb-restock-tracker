@@ -1473,3 +1473,30 @@ class TestOfficialInfoNoSearchFallback(unittest.TestCase):
         from datetime import date
         line = "9月16日（水）に発売のポケモンカードゲーム周辺グッズを一挙紹介！"
         self.assertTrue(cs._is_actionable_line(line, date(2026, 9, 9), False, True))
+
+
+class TestPokecardPeripheralNotNotified(unittest.TestCase):
+    """2026-09-09: 周辺グッズ（サプライ・リンク空）の新商品は通知しない。カード商品は通知する"""
+
+    def _products(self):
+        return {
+            "カードホルダー ピカチュウ|2026年 9月16日（水）": {
+                "title": "カードホルダー ピカチュウ", "releaseDate": "2026年 9月16日（水）",
+                "price": "800円（税込）", "link": "", "type": "peripheral"},
+            "拡張パック「ストームエメラルダ」|2026年 10月": {
+                "title": "拡張パック「ストームエメラルダ」", "releaseDate": "2026年 10月",
+                "price": "", "link": "/ex/m6/", "type": "expansion"},
+        }
+
+    def test_peripheral_skipped_but_expansion_kept(self):
+        products = self._products()
+        fresh = cs._pokecard_fresh_keys(products, sorted(products), [])
+        self.assertEqual(fresh, ["拡張パック「ストームエメラルダ」|2026年 10月"])
+
+    def test_all_peripheral_means_no_mail(self):
+        products = {k: v for k, v in self._products().items() if v["type"] == "peripheral"}
+        self.assertEqual(cs._pokecard_fresh_keys(products, sorted(products), []), [])
+
+    def test_known_keys_not_repeated(self):
+        products = self._products()
+        self.assertEqual(cs._pokecard_fresh_keys(products, sorted(products), sorted(products)), [])

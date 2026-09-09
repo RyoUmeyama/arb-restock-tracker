@@ -518,6 +518,9 @@ DIFF_LINE_MAXLEN = 90    # 1行の最大表示文字数（単語の途中で切�
 # resultAPI.php の4カテゴリ。新弾は (productTitle, releaseDate) のセット差分で検知する。
 # productType の正しい値は下記4つのみ（deck/other等は無効値で全件返すサイレント故障の罠）。
 POKECARD_PRODUCT_TYPES = ["expansion", "construction", "others", "peripheral"]
+# 新商品通知から外すカテゴリ。peripheral（周辺グッズ）はサプライで転売対象外、
+# かつAPIの詳細リンクが空で行動につながらない（2026-09-09）。取得・記録は続ける
+POKECARD_NOTIFY_SKIP_TYPES = ["peripheral"]
 # 新弾候補とする発売年の下限は check_stock.py の _this_year()-1 で動的に決まる
 # （年が変わっても自動追従するため固定年定数は持たない）。
 

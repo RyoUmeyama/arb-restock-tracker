@@ -1417,6 +1417,19 @@ def _snippet_lines(text, budget):
     return "\n".join(out)
 
 
+def _pokecard_fresh_keys(products, cur_keys, prev_keys):
+    """ポケカ公式APIの新商品のうち通知する価値のあるキーだけ返す。
+    周辺グッズ（productType=peripheral: カードホルダー・ショッピングバッグ・
+    ディスプレイフレーム等）は転売対象にならないサプライで、APIの詳細リンクも空
+    （2026-09-09 実害: 5件すべて周辺グッズで、行動できない通知になった）。
+    カード商品（expansion/construction/others）は詳細リンクが付き、こちらは通知する。
+    state への記録は全カテゴリで行う（発売カレンダー用）。"""
+    prev = set(prev_keys)
+    return [k for k in cur_keys if k not in prev
+            and products[k].get("type") not in config.POKECARD_NOTIFY_SKIP_TYPES
+            and not any(kw in products[k]["title"] for kw in config.SUPPLY_NOISE_KEYWORDS)]
+
+
 def _pokecard_detail_lines(products):
     """ポケカ公式API 新商品通知の本文ブロック。
     APIの link_detailPage は空のことが多く（2026-09-09 実害: 5商品すべて空で
@@ -1583,8 +1596,7 @@ def _process_item(item, prev, new_state, alerts, health, candidates=None):
         if prev_keys is None:
             print(f"  {item['name']}: 初回・{len(cur_keys)}商品を記録（通知なし）")
         else:
-            fresh = [k for k in cur_keys if k not in set(prev_keys)
-                     and not any(kw in products[k]["title"] for kw in config.SUPPLY_NOISE_KEYWORDS)]
+            fresh = _pokecard_fresh_keys(products, cur_keys, prev_keys)
             if fresh:
                 names = "、".join(products[k]["title"] for k in fresh[:5])
                 print(f"  {item['name']}: 新商品{len(fresh)}件検知🔔 ← 通知（{names}）")
