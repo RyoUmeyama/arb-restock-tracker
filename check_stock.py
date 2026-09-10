@@ -867,6 +867,8 @@ def run_price_screen(prev, new_state):
     除外中も本関数の相場評価は毎回走るので、相場回復でカウントが0に戻れば自動復帰する。"""
     prices, ok = fetch_altema_box_prices()
     time.sleep(config.REQUEST_INTERVAL)
+    if ok:
+        new_state["_altema_prices"] = prices  # 同一パス内で再利用（ヘルスレポートの候補提案）
     drop_counts = dict(prev.get("drop_counts", {}))
     if not ok:
         new_state["drop_counts"] = drop_counts
@@ -908,7 +910,10 @@ def run_price_screen(prev, new_state):
         net = net_proceeds(retail, market)
         flag = ""
         if verdict == "dropped" and drop_counts[key] >= config.DROP_CONFIRM_COUNT:
-            flag = f"  ⚠除外候補(連続{drop_counts[key]}回・自動除外は未有効)"
+            remain = config.DROP_CONFIRM_COUNT - drop_counts[key]
+            mode = (f"あと{remain}回で自動除外" if config.AUTO_DROP_ENABLED and remain > 0
+                    else "自動除外中" if config.AUTO_DROP_ENABLED else "自動除外は未有効")
+            flag = f"  ⚠除外候補(連続{drop_counts[key]}回・{mode})"
         print(f"    {name[:24]}: 定価{retail} 相場{market} 手残り{net:+.0f}円 → {verdict}{flag}")
     # 監視対象から外した銘柄の drop_counts は残さない（stateの肥大・幽霊キー防止）。
     valid_keys = {it["key"] for it in config.WATCH_ITEMS}
@@ -1210,7 +1215,11 @@ def append_heartbeat(prev, new_state, alerts, health):
             watched_urls = {it.get("url", "") for it in config.WATCH_ITEMS}
             fresh_pages = {sl: pg for sl, pg in pages.items()
                            if sl not in known and pg["url"] not in watched_urls}
-            new_state["am_pages_seen"] = sorted(set(pages) | known)[-300:]
+            # 既知は発見順を保ち、上限超過は古いものから捨てる（sorted()[-300:] だと
+            # スラッグのアルファベット順で切られ、古くない既知が落ちて再「発見」通知になる）
+            known_list = list(prev.get("am_pages_seen") or [])
+            known_list += [sl for sl in pages if sl not in known]
+            new_state["am_pages_seen"] = known_list[-300:]
             # 発見したページはそのまま動的監視へ登録する（人手のconfig編集を不要にする）
             if config.AUTO_WATCH_ENABLED:
                 n_auto = register_auto_watch(pages, prev, new_state)
@@ -1240,7 +1249,11 @@ def append_heartbeat(prev, new_state, alerts, health):
     # 監視追加候補の自動提案（altema相場ベース・提案済みは再提案しない）。
     # 監視リストが市場の移り変わりで古びるのを防ぐ（アビスアイ等の見落とし再発防止）。
     try:
-        prices, ok_p = fetch_altema_box_prices()
+        # 相場選別が同じパスで取得済みなら再取得しない（altema への二重アクセスを避ける）
+        if isinstance(new_state.get("_altema_prices"), dict):
+            prices, ok_p = new_state["_altema_prices"], True
+        else:
+            prices, ok_p = fetch_altema_box_prices()
         if ok_p:
             sugg_prev = prev.get("suggested_seen")
             first_sugg = not isinstance(sugg_prev, list)

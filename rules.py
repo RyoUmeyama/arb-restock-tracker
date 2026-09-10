@@ -9,8 +9,10 @@ import config
 
 
 def _this_year():
-    """現在の年（西暦）。ポケカ新弾の発売日フィルタを年経過で自動追従させるため。"""
-    return datetime.now().year
+    """現在の年（西暦・JST）。ポケカ新弾の発売日フィルタを年経過で自動追従させるため。
+    Actions は UTC なので naive の now() だと 1/1 0〜9時 JST に前年扱いになる。"""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Asia/Tokyo")).year
 
 
 def _normalize_box_name(s):
