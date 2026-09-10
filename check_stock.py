@@ -1588,7 +1588,14 @@ def _process_pokecen_news(item, prev, new_state, alerts, health, candidates):
         html = resp.content.decode("utf-8", errors="replace")
     except Exception as e:
         _hold_prev(prev, new_state, key)
-        _mark_fail(health, item, f"判定不能（前回状態を維持）: {e}")
+        if "wr.pokemoncenter-online.com" in str(e):
+            # 待機室（Queue-it waiting room）。抽選期間中はサイト全体がこの裏に入り
+            # botは到達できない（2026-09-09 13:36 JST〜、第3回追加抽選 9/11〜9/16 に向けた措置）。
+            # 恒常障害ではなく期間限定の想定内。告知はGoogle News経由（台帳側）と
+            # 公式FAQサイトで補う
+            _mark_fail(health, item, "待機室（waiting room）稼働中・到達不能（抽選期間の想定内・前回状態を維持）")
+        else:
+            _mark_fail(health, item, f"判定不能（前回状態を維持）: {e}")
         return
     ids = sorted(set(re.findall(r"news/\?id=(\d{8})", html)), reverse=True)
     if not ids:
