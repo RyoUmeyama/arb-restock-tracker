@@ -1118,7 +1118,8 @@ def append_heartbeat(prev, new_state, alerts, health):
     # それ以外の取得不能は故障の可能性があるので「要確認」として名前を出す。
     no_rakuten_id = not os.environ.get("RAKUTEN_APP_ID")
     def _is_expected(u):
-        return ("nyuka-now" in u) or (no_rakuten_id and "rakuten" in u)
+        return (("nyuka-now" in u) or (no_rakuten_id and "rakuten" in u)
+                or (WAITING_ROOM_MARK in u))
     expected = [n for n, u in health["fail"] if _is_expected(u)]
     unexpected = [n for n, u in health["fail"] if not _is_expected(u)]
     lines = [f"監視{ok_n + len(health['fail'])}件: 正常{ok_n}件"]
@@ -1129,11 +1130,15 @@ def append_heartbeat(prev, new_state, alerts, health):
         # 内訳を明記する（「何が・なぜ取れていないのか」が分からないと不安になるため）。
         exp_rakuten = sum(1 for n, u in health["fail"] if no_rakuten_id and "rakuten" in u)
         exp_nyuka = sum(1 for n, u in health["fail"] if "nyuka-now" in u)
+        exp_wr = sum(1 for n, u in health["fail"] if WAITING_ROOM_MARK in u)
         parts = []
         if exp_rakuten:
             parts.append(f"楽天API未設定{exp_rakuten}件=ID登録で有効化")
         if exp_nyuka:
             parts.append(f"nyuka-nowクラウド遮断{exp_nyuka}件")
+        if exp_wr:
+            # 一時的なアクセス集中でもメンテでも同じ扱い（解除されれば自動で追いつく）
+            parts.append(f"ポケセン待機室{exp_wr}件=一時的な混雑またはメンテ・毎パス再試行中")
         lines.append(f"想定内の取得不能{len(expected)}件（" + "・".join(parts) + "）")
     if unexpected:
         # 連続失敗パス数で恒常障害（要確認）と断続的な失敗（自動回復中）を区別する。
@@ -1558,6 +1563,8 @@ def _pokecen_lottery_candidate(title, text, today):
 # ポケセン記事: 1パスで本文を取得する新着記事の上限と、取得失敗の再試行上限
 POKECEN_ARTICLES_PER_PASS = 5
 POKECEN_FETCH_MAX_RETRY = 5
+# 待機室（Queue-it）による到達不能を health["fail"] の URL 欄で識別するための印
+WAITING_ROOM_MARK = "https://wr.pokemoncenter-online.com/"
 
 
 def _hold_prev(prev, new_state, key):
@@ -1589,11 +1596,13 @@ def _process_pokecen_news(item, prev, new_state, alerts, health, candidates):
     except Exception as e:
         _hold_prev(prev, new_state, key)
         if "wr.pokemoncenter-online.com" in str(e):
-            # 待機室（Queue-it waiting room）。抽選期間中はサイト全体がこの裏に入り
-            # botは到達できない（2026-09-09 13:36 JST〜、第3回追加抽選 9/11〜9/16 に向けた措置）。
-            # 恒常障害ではなく期間限定の想定内。告知はGoogle News経由（台帳側）と
-            # 公式FAQサイトで補う
-            _mark_fail(health, item, "待機室（waiting room）稼働中・到達不能（抽選期間の想定内・前回状態を維持）")
+            # 待機室（Queue-it waiting room）。一時的なアクセス集中で短時間だけ出ることも、
+            # 告知つきのメンテナンスで長く続くこともある（2026-09-10 ユーザー知見）。
+            # どちらでも扱いは同じ: 前回状態を維持して毎パス再試行し、解除された時点で
+            # 未取得の記事IDがそのまま新着として処理される（取りこぼさない）。
+            # ヘルスレポートでは「要確認」でなく待機室として分けて出す（health の URL で識別）
+            health["fail"].append((item["name"], WAITING_ROOM_MARK))
+            print(f"  {item['name']}: 待機室（waiting room）稼働中・到達不能（一時的な混雑またはメンテ。次パスで再試行）")
         else:
             _mark_fail(health, item, f"判定不能（前回状態を維持）: {e}")
         return

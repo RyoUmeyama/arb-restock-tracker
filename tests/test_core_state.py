@@ -313,3 +313,65 @@ class TestDiscoveryFailureRewarn(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWaitingRoom(unittest.TestCase):
+    """ポケセンの待機室（Queue-it）は一時的な混雑でもメンテでも同じ扱い:
+    前回状態を維持して毎パス再試行し、解除後に未取得の記事がそのまま新着になる。"""
+
+    def _item(self):
+        return {"name": "ポケセン", "method": "pokecen_news_ids", "url": "https://x/",
+                "key": "pk", "retail_price": 0, "require_keywords": ["抽選"]}
+
+    def test_waiting_room_is_expected_and_catches_up_after_release(self):
+        state = {"n": 0}
+
+        def fake_get(url, **kw):
+            if url == "https://x/":
+                state["n"] += 1
+                if state["n"] <= 2:
+                    raise RuntimeError("403 Client Error: Forbidden for url: https://wr.pokemoncenter-online.com/?c=pol")
+                return _ok_resp('<a href="/news/?id=20260911">a</a><a href="/news/?id=20260901">b</a>')
+            return _ok_resp("<h1>抽選のお知らせ</h1><main>抽選 本文</main>")
+        orig, orig_sleep = cs.http_get, cs.time.sleep
+        cs.http_get, cs.time.sleep = fake_get, (lambda s: None)
+        try:
+            prev = {"pk": ["20260901"]}
+            # 待機室中の2パス: 状態維持・fail は待機室として記録
+            for _ in range(2):
+                ns, alerts, health = {}, [], {"ok": [], "fail": [], "suppressed": 0}
+                cs._process_item(self._item(), prev, ns, alerts, health, [])
+                self.assertEqual(ns["pk"], ["20260901"])
+                self.assertEqual(health["fail"], [("ポケセン", cs.WAITING_ROOM_MARK)])
+                self.assertEqual(alerts, [])
+            # 解除後: 待機室中に出た記事 20260911 が新着として通知される
+            ns, alerts, health = {}, [], {"ok": [], "fail": [], "suppressed": 0}
+            cs._process_item(self._item(), prev, ns, alerts, health, [])
+            self.assertEqual(len(alerts), 1)
+            self.assertIn("20260911", alerts[0][1])
+        finally:
+            cs.http_get, cs.time.sleep = orig, orig_sleep
+
+    def test_heartbeat_reports_waiting_room_as_expected(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        class FakeDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 9, 10, 10, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        orig_dt, orig_opps = cs.datetime, cs.extract_opportunities
+        cs.datetime = FakeDT
+        cs.extract_opportunities = lambda prev, ns, today: []
+        orig_altema = cs.fetch_altema_box_prices
+        cs.fetch_altema_box_prices = lambda: ({}, False)
+        try:
+            alerts, ns = [], {}
+            health = {"ok": ["a"], "fail": [("ポケセン", cs.WAITING_ROOM_MARK)], "suppressed": 0}
+            cs.append_heartbeat({"digest_seen": []}, ns, alerts, health)
+            hb = next(a for a in alerts if "ヘルスレポート" in a[0]["name"])
+            self.assertIn("ポケセン待機室1件", hb[1])
+            self.assertNotIn("要確認", hb[1])
+        finally:
+            cs.datetime, cs.extract_opportunities = orig_dt, orig_opps
+            cs.fetch_altema_box_prices = orig_altema
