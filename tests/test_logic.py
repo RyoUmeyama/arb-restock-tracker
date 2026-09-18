@@ -688,46 +688,7 @@ class TestAmLotteryPageDiscovery(unittest.TestCase):
         self.assertEqual(list(pages), ["pokemoncard-new-reservation-lottery"])
 
 
-class TestLotteryCandidateExtraction(unittest.TestCase):
-    """応募台帳への連携候補の抽出（案A/B・店舗＋締切＋抽選語が揃った行のみ）。"""
-
-    ITEM = {"name": "ポケカ ストームエメラルダ 抽選/予約まとめ（anime-matsuri）"}
-
-    def _x(self, line):
-        from datetime import date
-        return cs.extract_lottery_candidate(line, self.ITEM, date(2026, 7, 14), cs.config.STORE_NAME_HINTS)
-
-    def test_full_candidate(self):
-        c = self._x("ヨドバシで抽選受付 7月20日〜7月27日")
-        self.assertEqual(c["channel"], "ヨドバシ")
-        self.assertEqual(c["product"], "ポケカ ストームエメラルダ")
-        self.assertEqual(c["apply_end"], "2026-07-27")
-        self.assertEqual(c["apply_start"], "2026-07-20")
-
-    def test_no_store_no_candidate(self):
-        self.assertIsNone(self._x("抽選受付 7月20日〜7月27日"))
-
-    def test_no_date_no_candidate(self):
-        self.assertIsNone(self._x("ヨドバシで抽選受付中"))
-
-    def test_no_lottery_word_no_candidate(self):
-        self.assertIsNone(self._x("ヨドバシで7月20日に再入荷"))
-
-    def test_save_dedupes_by_id(self):
-        import tempfile, os, json
-        with tempfile.TemporaryDirectory() as d:
-            orig = cs.DETECTED_LOTTERIES_FILE
-            cs.DETECTED_LOTTERIES_FILE = os.path.join(d, "det.json")
-            try:
-                c = {"channel": "ヨドバシ", "product": "P", "apply_start": None,
-                     "apply_end": "2026-07-27", "source_url": "u", "detected_at": "2026-07-14"}
-                cs.save_lottery_candidates([c])
-                cs.save_lottery_candidates([dict(c)])  # 同一候補の再検知
-                data = json.load(open(cs.DETECTED_LOTTERIES_FILE))
-                self.assertEqual(len(data), 1)
-                self.assertIn("id", data[0])
-            finally:
-                cs.DETECTED_LOTTERIES_FILE = orig
+# TestLotteryCandidateExtraction は連携撤去（2026-09-18）に伴い削除
 
 
 if __name__ == "__main__":
@@ -1420,37 +1381,7 @@ class TestSuppressionAudit(unittest.TestCase):
             cs.datetime = orig
 
 
-class TestPokecenLotteryCandidate(unittest.TestCase):
-    """2026-09-09: ポケセン公式記事から応募台帳へ抽選を直接渡す（第3回追加抽選の取りこぼし対策）"""
-    TITLE = "ポケモンカードゲーム30周年記念商品の追加抽選販売について"
-    TEXT = ("MEGA 拡張パック「30th CELEBRATION」BOX ほかの追加抽選販売を実施いたします。\n"
-            "発売日 2026年9月16日（水）\n"
-            "応募受付期間 2026年9月11日（金）16時00分～9月16日（水）16時59分\n"
-            "当選発表 9月30日（水）13時00分以降\n"
-            "注文期間 9月30日（水）13時00分～10月6日（火）16時59分")
-
-    def test_round3_article_yields_apply_period(self):
-        from datetime import date
-        c = cs._pokecen_lottery_candidate(self.TITLE, self.TEXT, date(2026, 9, 4))
-        self.assertIsNotNone(c)
-        self.assertEqual(c["channel"], "ポケモンセンターオンライン")
-        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-09-11", "2026-09-16"))
-        self.assertEqual(c["product"], self.TITLE)
-
-    def test_order_period_is_not_mistaken_for_apply_period(self):
-        from datetime import date
-        text = "追加抽選の当選発表 9月30日（水）13時以降\n注文期間 9月30日（水）13時00分～10月6日（火）16時59分"
-        self.assertIsNone(cs._pokecen_lottery_candidate("追加抽選のお知らせ", text, date(2026, 9, 4)),
-                          "応募/受付の語がない期間（注文期間）は応募期間とみなさない")
-
-    def test_non_lottery_article_ignored(self):
-        from datetime import date
-        self.assertIsNone(cs._pokecen_lottery_candidate(
-            "配送遅延のお知らせ", "応募受付 9月1日〜9月5日", date(2026, 9, 4)))
-
-    def test_past_period_ignored(self):
-        from datetime import date
-        self.assertIsNone(cs._pokecen_lottery_candidate(self.TITLE, self.TEXT, date(2026, 9, 20)))
+# TestPokecenLotteryCandidate は連携撤去（2026-09-18）に伴い削除
 
 
 class TestPokecardDetailLines(unittest.TestCase):
@@ -1579,35 +1510,7 @@ class TestAuditStoreDomainHostMatch(unittest.TestCase):
                          "https://www.pokemoncenter-online.com/lottery/")
 
 
-class TestAuditLotteryDeadline(unittest.TestCase):
-    """H3: 行内の最大日付を締切にしていたため、発売日・当選発表日が締切として台帳に入っていた。"""
-
-    ITEM = {"name": "ポケカ 30th CELEBRATION 抽選/予約まとめ（anime-matsuri）"}
-
-    def _x(self, line, today=None):
-        from datetime import date
-        return cs.extract_lottery_candidate(line, self.ITEM, today or date(2026, 8, 30),
-                                            cs.config.STORE_NAME_HINTS)
-
-    def test_release_date_before_apply_range_not_deadline(self):
-        c = self._x("【ヨドバシ】9月16日発売「30th」BOX 抽選受付 9月1日〜9月8日")
-        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-09-01", "2026-09-08"))
-
-    def test_winner_announcement_not_deadline(self):
-        c = self._x("ヨドバシ 抽選受付 9月1日〜9月8日 当選発表9月12日")
-        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-09-01", "2026-09-08"))
-
-    def test_release_date_only_yields_none(self):
-        # 応募期間が読めない行（発売日しか無い）は締切不明＝台帳に登録しない
-        self.assertIsNone(self._x("ヨドバシで9月16日発売のBOXを抽選予約受付中"))
-
-    def test_order_period_not_deadline(self):
-        c = self._x("ポケモンセンター 応募受付期間 9月11日〜9月16日 注文期間 9月30日〜10月6日")
-        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-09-11", "2026-09-16"))
-
-    def test_single_until_date_still_works(self):
-        c = self._x("【ヨドバシ】抽選受付開始 9月20日まで")
-        self.assertEqual((c["apply_start"], c["apply_end"]), (None, "2026-09-20"))
+# TestAuditLotteryDeadline は連携撤去（2026-09-18）に伴い削除
 
 
 class TestAuditEndedAndNavLines(unittest.TestCase):

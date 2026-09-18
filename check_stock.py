@@ -10,8 +10,6 @@
      方式ごとの処理は METHOD_HANDLERS（_process_<method>）に分かれている
   2. 変化を通知（メール＋Discord）。通知が届いてから状態を保存する（失敗時は次パスで再通知）
   3. 朝1回の日次ヘルスレポート（生存確認・取得不能の内訳・直近24hの抑制開示）
-  4. 店舗・締切が確定した抽選は data/detected_lotteries.json へ書き出し、応募台帳
-     （arb-lottery-ledger）が取り込む
 
 判定規則は rules.py、リンク解決は links.py、HTTP は netutil.py（仕様: NOTIFICATION_RULES.md）。
 """
@@ -38,7 +36,7 @@ from rules import (
     _this_year, _upcoming_dates, _normalize_box_name, _deck_supply_rule,
     _is_actionable_line, _expired_pokeca_titles, _mentions_expired,
     match_altema_price, passes_profit, net_proceeds, _item_short_name,
-    extract_lottery_candidate, upcoming_releases, passes_require_keywords,
+    upcoming_releases, passes_require_keywords,
 )
 from links import (
     _norm_link_text, _clean_store_url, _unwrap_affiliate, extract_anchors,
@@ -666,56 +664,12 @@ def compute_page_signature(item):
 
 
 
-DETECTED_LOTTERIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "detected_lotteries.json")
-
-
-def _detected_lotteries_summary():
-    """ヘルスレポート用: 台帳連携ファイルの件数と最終検知日を1行で返す。"""
-    try:
-        if not os.path.exists(DETECTED_LOTTERIES_FILE):
-            return "🔗 台帳連携: 検知抽選の書き出しなし（店舗・締切が確定した抽選が未検知）"
-        with open(DETECTED_LOTTERIES_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        last = max((c.get("detected_at") or "" for c in data), default="")
-        return f"🔗 台帳連携: 検知抽選{len(data)}件（最終検知 {last or '不明'}）"
-    except Exception as e:
-        return f"🔗 台帳連携: 書き出しファイルを読めない（{e}）"
-
-
-def save_lottery_candidates(cands):
-    """検知した抽選候補を data/detected_lotteries.json に追記保存する（id重複は除外・上限200）。
-    このファイルはActionsがリポジトリにコミットし、応募台帳（arb-lottery-ledger）が
-    取り込んで締切リマインドを行う（案A/案B: 台帳の一本化・2026-07-14）。"""
-    if not cands:
-        return
-    try:
-        existing = []
-        if os.path.exists(DETECTED_LOTTERIES_FILE):
-            with open(DETECTED_LOTTERIES_FILE, encoding="utf-8") as f:
-                existing = json.load(f)
-        known = {c.get("id") for c in existing}
-        added = 0
-        for c in cands:
-            cid = hashlib.sha256(
-                f"{c['channel']}|{c['product']}|{c.get('apply_end')}".encode("utf-8")
-            ).hexdigest()[:16]
-            if cid in known:
-                continue
-            known.add(cid)
-            existing.append({"id": cid, **c})
-            added += 1
-        if not added:
-            return
-        existing = existing[-200:]
-        os.makedirs(os.path.dirname(DETECTED_LOTTERIES_FILE), exist_ok=True)
-        tmp = DETECTED_LOTTERIES_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp, DETECTED_LOTTERIES_FILE)
-        print(f"  📒 抽選候補{added}件を台帳連携ファイルに追記")
-    except Exception as e:
-        print(f"  ⚠ 抽選候補の保存失敗（通知には影響なし）: {e}")
+# 応募台帳（arb-lottery-ledger）への抽選候補連携（detected_lotteries.json・2026-07-14 案A/B、
+# ポケセン公式記事からの直接候補化は 2026-09-09 追加）は 2026-09-18 に撤去した。
+# 候補化条件（店舗・締切の両方確定）が実装以来一度も満たされず書き出しゼロのまま、
+# 台帳側はニュース抽出経路で同じ抽選を拾えていたため（台帳側の取り込みも同日撤去）。
+# 復活させる場合は git 履歴の save_lottery_candidates / extract_lottery_candidate /
+# _pokecen_lottery_candidate を参照。
 
 
 def load_state():
@@ -1123,9 +1077,6 @@ def append_heartbeat(prev, new_state, alerts, health):
     expected = [n for n, u in health["fail"] if _is_expected(u)]
     unexpected = [n for n, u in health["fail"] if not _is_expected(u)]
     lines = [f"監視{ok_n + len(health['fail'])}件: 正常{ok_n}件"]
-    # 台帳連携の生存確認: 検知抽選の書き出し件数と最終検知日（2026-09-09 監査: 連携経路が
-    # 実装以来8週間ゼロ件のまま誰にも見えていなかった）
-    lines.append(_detected_lotteries_summary())
     if expected:
         # 内訳を明記する（「何が・なぜ取れていないのか」が分からないと不安になるため）。
         exp_rakuten = sum(1 for n, u in health["fail"] if no_rakuten_id and "rakuten" in u)
@@ -1513,53 +1464,6 @@ def _pokecard_detail_lines(products):
     return lines
 
 
-_POKECEN_PERIOD_RE = re.compile(
-    r"(?:(20\d\d)年)?(\d{1,2})月(\d{1,2})日"
-    r"\s*(?:[（(][月火水木金土日祝][）)])?\s*(?:\d{1,2}(?:時\d{0,2}分?|[:：]\d{2}))?\s*"
-    r"[〜～~]\s*(?:(20\d\d)年)?(\d{1,2})月(\d{1,2})日"
-)
-_POKECEN_APPLY_WORDS = ("応募", "受付", "申込", "申し込み", "抽選期間", "エントリー")
-
-
-def _pokecen_lottery_candidate(title, text, today):
-    """ポケセンオンライン公式記事から応募台帳に渡す抽選候補を作る。
-    条件（精度優先）: 「抽選」を含み、本文に「M月D日(曜)HH時MM分〜M月D日」形式の期間があり、
-    その直前40字に応募/受付系の語があること（発表日・注文期間・発売日の範囲と区別する）。
-    複数の期間があれば応募語つきの最初のものを採る。"""
-    from datetime import date as _date
-    body = f"{title}\n{text}"
-    if "抽選" not in body:
-        return None
-
-    def _resolve(y, m, d):
-        try:
-            if y:
-                return _date(int(y), int(m), int(d))
-            dt = _date(today.year, int(m), int(d))
-            return _date(today.year + 1, int(m), int(d)) if (today - dt).days > 180 else dt
-        except ValueError:
-            return None
-
-    picked = None
-    for m in _POKECEN_PERIOD_RE.finditer(body):
-        context = body[max(0, m.start() - 40):m.start()]
-        if any(w in context for w in _POKECEN_APPLY_WORDS):
-            picked = m
-            break
-    if picked is None:
-        return None
-    y1, mo1, d1, y2, mo2, d2 = picked.groups()
-    start, end = _resolve(y1 or y2, mo1, d1), _resolve(y2 or y1, mo2, d2)
-    if not start or not end or end < start or (end - today).days < 0 or (end - today).days > 90:
-        return None
-    return {
-        "channel": "ポケモンセンターオンライン",
-        "product": (title or "ポケセンオンライン抽選").strip()[:60],
-        "apply_start": start.isoformat(),
-        "apply_end": end.isoformat(),
-    }
-
-
 # ポケセン記事: 1パスで本文を取得する新着記事の上限と、取得失敗の再試行上限
 POKECEN_ARTICLES_PER_PASS = 5
 POKECEN_FETCH_MAX_RETRY = 5
@@ -1581,7 +1485,7 @@ def _mark_fail(health, item, msg):
     print(f"  {item['name']}: {msg}")
 
 
-def _process_pokecen_news(item, prev, new_state, alerts, health, candidates):
+def _process_pokecen_news(item, prev, new_state, alerts, health):
     """ポケセンオンラインの記事ID差分で新着ニュースを検知する。
     経緯(2026-08-19): 抽選応募一覧(/lottery/apply.html)はVueテンプレートで
     中身がJSレンダリングのため、抽選が載っても静的HTMLは変化せず検知できなかった。
@@ -1658,18 +1562,6 @@ def _process_pokecen_news(item, prev, new_state, alerts, health, candidates):
         snippet = _snippet_lines(text, 500)
         indented = "\n".join("  " + l for l in snippet.splitlines())
         details.append(f"{head}\n{indented}\n{url}")
-        # 台帳連携: 抽選の応募期間が本文から確定できたら応募台帳へ構造化して渡す。
-        # 2026-09-04 の第3回追加抽選（9/11〜9/16）はこの記事で検知・通知できていたのに
-        # 台帳に載らず、リマインドが出なかった（台帳側のLLM抽出が死んでいた）。
-        # 公式一次情報からの直接登録で、台帳側の記事抽出に依存しない経路を作る。
-        if candidates is not None:
-            _today = datetime.now(ZoneInfo("Asia/Tokyo")).date()
-            c = _pokecen_lottery_candidate(title or "", text, _today)
-            if c:
-                c["source_url"] = url
-                c["detected_at"] = _today.isoformat()
-                candidates.append(c)
-                print(f"    台帳候補: {c['product'][:40]} 〆{c['apply_end']}")
     # 取得できなかったIDは既知リストから除外して次回また fresh に載せる
     new_state[key] = [i for i in ids[:60] if i not in set(retry_later)]
     if fail_counts:
@@ -1683,7 +1575,7 @@ def _process_pokecen_news(item, prev, new_state, alerts, health, candidates):
     alerts.append((item, "\n" + "\n\n".join(details), "info"))
 
 
-def _process_pokecard_official(item, prev, new_state, alerts, health, candidates):
+def _process_pokecard_official(item, prev, new_state, alerts, health):
     """ポケカ公式API: (title,releaseDate)セット差分で新商品を検知（初回は基準記録）。"""
     key = item["key"]
     products, ok = fetch_pokecard_new_products()
@@ -1711,7 +1603,7 @@ def _process_pokecard_official(item, prev, new_state, alerts, health, candidates
         print(f"  {item['name']}: 新商品なし（{len(cur_keys)}商品）")
 
 
-def _process_onepiece_news(item, prev, new_state, alerts, health, candidates):
+def _process_onepiece_news(item, prev, new_state, alerts, health):
     """ワンピ公式ニュース: 新着記事の差分で通知（初回は基準記録）。"""
     key = item["key"]
     articles, ok = fetch_onepiece_news()
@@ -1753,7 +1645,7 @@ def _process_onepiece_news(item, prev, new_state, alerts, health, candidates):
         print(f"  {item['name']}: 新着なし（{len(cur_keys)}記事）")
 
 
-def _process_page_update(item, prev, new_state, alerts, health, candidates):
+def _process_page_update(item, prev, new_state, alerts, health):
     """告知ページ: 前回ハッシュと変化したら通知（初回は基準値を保存のみ）。"""
     key = item["key"]
     sig, lines, ok, html = compute_page_signature(item)
@@ -1807,14 +1699,6 @@ def _process_page_update(item, prev, new_state, alerts, health, candidates):
         health["suppressed"] = health.get("suppressed", 0) + 1
         print(f"  {item['name']}: 更新あり（実質情報なし・通知抑制。新規{len(added)}行）")
         return
-    # 台帳連携: 店舗・締切が確定した抽選は構造化して応募台帳へ渡す（案A/B）
-    if candidates is not None:
-        for l in actionable:
-            c = extract_lottery_candidate(l, item, today_jst, config.STORE_NAME_HINTS)
-            if c:
-                c["source_url"] = links.get(l) or item.get("url", "")
-                c["detected_at"] = today_jst.isoformat()
-                candidates.append(c)
     # nyuka-now集約ページは「過去の販売・再販履歴のログ」で、履歴行は検知時点で
     # ほぼ完売している（2026-08-26 実害: アニメイトFB10再販を通知→購入不可）。
     # 履歴行（開始済みイベント）は直リンク先に品切れ表示がないことを確認できた
@@ -1866,7 +1750,7 @@ def _process_page_update(item, prev, new_state, alerts, health, candidates):
     alerts.append((item, detail, "info"))
 
 
-def _process_stock(item, prev, new_state, alerts, health, candidates):
+def _process_stock(item, prev, new_state, alerts, health):
     """在庫系（toei_stock_status / rakuten_books / 旧gdb_soldout）: 在庫なし→ありの遷移で通知。"""
     key = item["key"]
     in_stock, ok, detail = check_item(item)
@@ -1934,10 +1818,10 @@ METHOD_HANDLERS = {
 }
 
 
-def _process_item(item, prev, new_state, alerts, health, candidates=None):
+def _process_item(item, prev, new_state, alerts, health):
     """1監視項目の判定・状態更新・通知起票。run_once から項目ごとに例外隔離されて呼ばれる。"""
     handler = METHOD_HANDLERS.get(item.get("method"), _process_stock)
-    handler(item, prev, new_state, alerts, health, candidates)
+    handler(item, prev, new_state, alerts, health)
 
 
 def run_once():
@@ -1958,7 +1842,6 @@ def run_once():
             "\n全監視項目が今回のパスで基準を取り直します（このパスの変化は通知されません）。"
             "\n直近に見逃したくない抽選・予約があれば、各まとめページを一度手で確認してください。",
             "info"))
-    candidates = []  # 応募台帳へ連携する抽選候補（店舗・締切が確定したもの）
 
     # Phase2: RSS発見器で新弾・再販を自動キャッチ（固定リストを動的に補完）。
     # 想定外の例外でもパス全体を壊さない（関連stateを前回維持して継続）。
@@ -2019,7 +1902,7 @@ def run_once():
         # 1商品の判定で想定外の例外が起きてもパス全体を壊さない（バグ・サイト構造の
         # 急変・不正なレスポンス等）。その商品だけ前回状態を維持して次へ進む。
         try:
-            _process_item(item, prev, new_state, alerts, health, candidates)
+            _process_item(item, prev, new_state, alerts, health)
         except Exception as e:
             if key in prev:
                 new_state[key] = prev[key]
@@ -2029,8 +1912,6 @@ def run_once():
             print(f"  ⚠ {item['name']}: 想定外エラーで判定不能（前回状態を維持）: {e}")
 
     _update_fail_streaks(prev, new_state, health)
-
-    save_lottery_candidates(candidates)
 
     # 週次運用サマリ用の集計（通知フィルタの過剰抑制をユーザーが確認できるようにする）
     stats = dict(prev.get("weekly_stats") or {})

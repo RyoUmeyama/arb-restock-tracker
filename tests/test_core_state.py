@@ -52,10 +52,10 @@ class TestHoldPrevOnFailure(unittest.TestCase):
         cs.http_get = fake_get
         try:
             s1, alerts1, health = {}, [], {"ok": [], "fail": [], "suppressed": 0}
-            cs._process_item(item, {}, s1, alerts1, health, [])
+            cs._process_item(item, {}, s1, alerts1, health)
             self.assertNotIn("pk", s1, "失敗パスは基準を書かない")
             s2, alerts2, health2 = {}, [], {"ok": [], "fail": [], "suppressed": 0}
-            cs._process_item(item, s1, s2, alerts2, health2, [])
+            cs._process_item(item, s1, s2, alerts2, health2)
             self.assertEqual(alerts2, [], "復旧パスは初回扱い＝通知しない")
             self.assertEqual(s2["pk"], ["20260904", "20260821"])
         finally:
@@ -71,10 +71,10 @@ class TestHoldPrevOnFailure(unittest.TestCase):
         cs.time.sleep = lambda s: None
         try:
             s1, a1 = {}, []
-            cs._process_item(item, {}, s1, a1, {"ok": [], "fail": [], "suppressed": 0}, [])
+            cs._process_item(item, {}, s1, a1, {"ok": [], "fail": [], "suppressed": 0})
             self.assertNotIn("st", s1)
             s2, a2 = {}, []
-            cs._process_item(item, s1, s2, a2, {"ok": [], "fail": [], "suppressed": 0}, [])
+            cs._process_item(item, s1, s2, a2, {"ok": [], "fail": [], "suppressed": 0})
             self.assertEqual(a2, [], "cache miss→失敗→在庫あり で「復活！」を出さない")
         finally:
             cs.check_item = orig
@@ -130,14 +130,7 @@ class TestCarryKeysNoNone(unittest.TestCase):
         self.assertEqual(new_state.get("last_heartbeat"), today)
 
 
-class TestPokecenPeriodColonTime(unittest.TestCase):
-    """M2: 「12:00〜」表記（8/3の実記事の書式）で応募期間が取れなかった。"""
-
-    def test_colon_time_period(self):
-        text = "応募受付期間 8月10日（月）12:00～8月14日（金）16:59\n抽選です"
-        c = cs._pokecen_lottery_candidate("抽選販売のお知らせ", text, date(2026, 8, 3))
-        self.assertIsNotNone(c)
-        self.assertEqual((c["apply_start"], c["apply_end"]), ("2026-08-10", "2026-08-14"))
+# TestPokecenPeriodColonTime は連携撤去（2026-09-18）に伴い削除
 
 
 class TestPokecenRetryHandling(unittest.TestCase):
@@ -160,7 +153,7 @@ class TestPokecenRetryHandling(unittest.TestCase):
         try:
             new_state = {}
             cs._process_item(self._item(), {"pk": []}, new_state, [],
-                             {"ok": [], "fail": [], "suppressed": 0}, [])
+                             {"ok": [], "fail": [], "suppressed": 0})
             known = set(new_state["pk"])
             self.assertEqual(len(known), cs.POKECEN_ARTICLES_PER_PASS)
             self.assertTrue(all(i in known for i in sorted(ids, reverse=True)[:5]))
@@ -178,14 +171,14 @@ class TestPokecenRetryHandling(unittest.TestCase):
             prev = {"pk": [], "pokecen_fetch_fail": {"20260901": cs.POKECEN_FETCH_MAX_RETRY - 1}}
             new_state = {}
             cs._process_item(self._item(), prev, new_state, [],
-                             {"ok": [], "fail": [], "suppressed": 0}, [])
+                             {"ok": [], "fail": [], "suppressed": 0})
             self.assertIn("20260901", new_state["pk"], "上限到達で既知化して枠を空ける")
             reasons = [e.get("reason") for e in new_state.get("suppressed_log", [])]
             self.assertIn("本文取得の再試行上限", reasons)
             # 途中（1回目）なら既知化しない
             new_state2 = {}
             cs._process_item(self._item(), {"pk": []}, new_state2, [],
-                             {"ok": [], "fail": [], "suppressed": 0}, [])
+                             {"ok": [], "fail": [], "suppressed": 0})
             self.assertNotIn("20260901", new_state2["pk"])
             self.assertEqual(new_state2["pokecen_fetch_fail"], {"20260901": 1})
         finally:
@@ -281,21 +274,7 @@ class TestMethodDispatch(unittest.TestCase):
         self.assertIs(cs.METHOD_HANDLERS.get("toei_stock_status", cs._process_stock), cs._process_stock)
 
 
-class TestDetectedLotteriesSummary(unittest.TestCase):
-    def test_summary_counts_and_last_date(self):
-        import tempfile
-        orig = cs.DETECTED_LOTTERIES_FILE
-        with tempfile.TemporaryDirectory() as d:
-            cs.DETECTED_LOTTERIES_FILE = os.path.join(d, "dl.json")
-            try:
-                self.assertIn("書き出しなし", cs._detected_lotteries_summary())
-                json.dump([{"id": "a", "detected_at": "2026-09-04"}, {"id": "b", "detected_at": "2026-09-09"}],
-                          open(cs.DETECTED_LOTTERIES_FILE, "w"))
-                s = cs._detected_lotteries_summary()
-                self.assertIn("2件", s)
-                self.assertIn("2026-09-09", s)
-            finally:
-                cs.DETECTED_LOTTERIES_FILE = orig
+# TestDetectedLotteriesSummary は連携撤去（2026-09-18）に伴い削除
 
 
 class TestDiscoveryFailureRewarn(unittest.TestCase):
@@ -340,13 +319,13 @@ class TestWaitingRoom(unittest.TestCase):
             # 待機室中の2パス: 状態維持・fail は待機室として記録
             for _ in range(2):
                 ns, alerts, health = {}, [], {"ok": [], "fail": [], "suppressed": 0}
-                cs._process_item(self._item(), prev, ns, alerts, health, [])
+                cs._process_item(self._item(), prev, ns, alerts, health)
                 self.assertEqual(ns["pk"], ["20260901"])
                 self.assertEqual(health["fail"], [("ポケセン", cs.WAITING_ROOM_MARK)])
                 self.assertEqual(alerts, [])
             # 解除後: 待機室中に出た記事 20260911 が新着として通知される
             ns, alerts, health = {}, [], {"ok": [], "fail": [], "suppressed": 0}
-            cs._process_item(self._item(), prev, ns, alerts, health, [])
+            cs._process_item(self._item(), prev, ns, alerts, health)
             self.assertEqual(len(alerts), 1)
             self.assertIn("20260911", alerts[0][1])
         finally:
